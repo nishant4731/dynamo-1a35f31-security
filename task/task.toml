@@ -6,8 +6,8 @@ description = ""                 # one-line summary of the task
 
 [metadata]
 # --- Pre-seeded for you when this repo was created — DO NOT EDIT ---
-category = ""                      # diversity category, assigned to your task by the Dynamo team
-subcategory = ""                   # diversity subcategory, assigned by the Dynamo team
+category = "Security"                      # diversity category, assigned to your task by the Dynamo team
+subcategory = "Security hardening"                   # diversity subcategory, assigned by the Dynamo team
 # --- Fixed for this dataset — LEAVE AS-IS ---
 model_tested = "Opus-4.8"           # difficulty-benchmarking model (do not change)
 agent_tested = "Terminus-2"        # difficulty-benchmarking agent (do not change)
