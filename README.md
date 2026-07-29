@@ -14,17 +14,17 @@ write access to the base).
 
 ## How to submit (fork → PR)
 
-Requires the [GitHub CLI](https://cli.github.com/) (`gh`). Replace `<your-task-repo>`
+Requires the [GitHub CLI](https://cli.github.com/) (`gh`). Replace `dynamo-1a35f31-security`
 with the repository you were assigned:
 
 ```bash
-gh repo fork handshake-project-dynamo/<your-task-repo> --clone
-cd <your-task-repo>
+gh repo fork handshake-project-dynamo/dynamo-1a35f31-security --clone
+cd dynamo-1a35f31-security
 git checkout -b submission
 #  ... build the task (see below) ...
 git add -A && git commit -m "Task submission"
 git push -u origin submission
-gh pr create --repo handshake-project-dynamo/<your-task-repo> --fill
+gh pr create --repo handshake-project-dynamo/dynamo-1a35f31-security --fill
 ```
 
 To iterate after reading the feedback: edit, then `git commit` and `git push`.
