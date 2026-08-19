@@ -14,9 +14,13 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  id-token: write
+  statuses: read
 
 concurrency:
   group: dynamo-review-${{ github.event.pull_request.number }}
+  # A push replaces the review in flight, so the result you see is always the one for your
+  # latest commit.
   cancel-in-progress: true
 
 jobs:
