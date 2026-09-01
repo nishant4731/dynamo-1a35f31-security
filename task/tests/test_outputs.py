@@ -238,6 +238,10 @@ def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
     {"format": 1, "operations": [{"op": "write", "path": "seed/partial", "data_b64": enc(b"x")}, {"op": "unknown", "path": "seed/no"}]},
     {"format": 1, "operations": [{"op": "write", "path": "seed/bad", "data_b64": enc(b"x"), "mode": 0o4755}]},
     {"format": 1, "operations": [{"op": "write", "path": "seed/bad", "data_b64": enc(b"x"), "xattrs": {"security.capability": enc(b"x")}}]},
+    {"format": 1, "operations": [{"op": "mkdir", "path": "seed/bad-dir", "mode": 0o2755}]},
+    {"format": 1, "operations": [{"op": "symlink", "path": "seed/bad-link", "target": "keep.txt", "mode": 0o4755}]},
+    {"format": 1, "operations": [{"op": "hardlink", "path": "seed/bad-link", "target": "seed/keep.txt", "xattrs": {"security.capability": enc(b"x")}}]},
+    {"format": 1, "operations": [{"op": "rename", "src": "seed/old.txt", "dst": "seed/bad-move", "mode": 0o4755}]},
 ])
 def test_unsafe_bundles_reject_without_partial_writes(bundle: dict):
     """Unsafe paths, links, metadata, and late failures require non-zero rejection with an unchanged target."""
