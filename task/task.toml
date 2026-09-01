@@ -20,7 +20,7 @@ verification_explanation = "The verifier runs the submitted program on independe
 timeout_sec = 180.0
 
 [agent]
-timeout_sec = 7200.0
+timeout_sec = 3600.0
 
 [environment]
 build_timeout_sec = 600.0
