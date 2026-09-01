@@ -1,0 +1,9 @@
+# Rootfs delta semantics
+
+The visible sample is normative for the benign behavior of the supplied utility. The verifier uses the same semantics on fresh bundles. A path is a canonical relative path: no leading slash, NUL, `..`, `.`, empty component, or trailing slash. Operations are sequential.
+
+`mkdir` creates or updates a directory. `write` replaces a regular file. `symlink` stores link text without resolving it. `hardlink` requires an existing regular-file target and preserves inode identity. `rename` is an in-root move. `unlink` removes one object and is idempotent. `whiteout` removes a complete subtree. `opaque` clears a directory's children but preserves the directory. The parent must exist at the time of the operation.
+
+After each structural operation, metadata is applied in this exact order: `uid`/`gid`, `mode`, `xattrs`, `mtime_ns`. Compared fields are permission and sticky-bit mode, uid, gid, nanosecond mtime, and all declared `user.*` xattrs. Device nodes, FIFOs, sockets, setuid/setgid modes, and non-`user.*` xattrs are invalid.
+
+The existing implementation is intentionally unsafe. Preserve the benign semantics while making every operation confined to the target root, race resistant, and failure atomic. Rejection means non-zero exit and no target-tree change.

@@ -1,0 +1,9 @@
+{
+  "format": 1,
+  "operations": [
+    {"op": "mkdir", "path": "etc", "mode": 493, "uid": 0, "gid": 0, "mtime_ns": 1700000000000000000},
+    {"op": "write", "path": "etc/app.conf", "data_b64": "c2FmZV9tb2RlPXllcwo=", "mode": 416, "uid": 0, "gid": 0, "mtime_ns": 1700000001000000000, "xattrs": {"user.role": "Y29uZmln"}},
+    {"op": "mkdir", "path": "run", "mode": 1023, "uid": 1000, "gid": 1000, "mtime_ns": 1700000002000000000},
+    {"op": "symlink", "path": "run/current", "target": "../etc/app.conf"}
+  ]
+}
