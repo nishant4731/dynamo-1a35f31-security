@@ -6,4 +6,4 @@ The visible sample is normative for the benign behavior of the supplied utility.
 
 After each structural operation, metadata is applied in this exact order: `uid`/`gid`, `mode`, `xattrs`, `mtime_ns`. Compared fields are permission and sticky-bit mode, uid, gid, nanosecond mtime, and all declared `user.*` xattrs. Device nodes, FIFOs, sockets, setuid/setgid modes, and non-`user.*` xattrs are invalid.
 
-The existing implementation is intentionally unsafe. Preserve the benign semantics while making every operation confined to the target root, race resistant, and failure atomic. Rejection means non-zero exit and no target-tree change.
+The existing implementation is intentionally unsafe. Preserve the benign semantics while making every operation confined to the target root, race resistant, and failure atomic. Rejection means non-zero exit and no target-tree change; stderr wording is deliberately not prescribed.
