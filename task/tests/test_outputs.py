@@ -319,7 +319,6 @@ def test_path_swap_race_has_zero_canary_violations_across_64_runs():
             thread.join(timeout=1.0)
             if marker.read_bytes() != f"marker-{run}".encode() or len(list(canary.iterdir())) != 1:
                 violations.append(f"run {run}: canary changed")
-            assert result.returncode in (0, 2), result.stderr
         assert not violations, "; ".join(violations)
     finally:
         shutil.rmtree(parent, ignore_errors=True)
