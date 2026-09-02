@@ -337,6 +337,7 @@ def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
             assert regular["var/cache/blob"] == regular["var/cache/blob-renamed"]
 
 
+@pytest.mark.parametrize("fallback", [False, True])
 @pytest.mark.parametrize("bundle", [
     {"format": 1, "operations": [{"op": "write", "path": "../escape", "data_b64": enc(b"x")}]},
     {"format": 1, "operations": [{"op": "write", "path": "/absolute", "data_b64": enc(b"x")}]},
@@ -359,15 +360,15 @@ def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
     {"format": 1, "operations": [{"op": "rename", "src": "seed/old.txt", "dst": "seed/bad-move", "mode": 0o4755}]},
     {"format": 1, "operations": [{"op": "hardlink", "path": "seed/transaction-link", "target": "seed/keep.txt", "mode": 0o600}, {"op": "rename", "src": "seed/old.txt", "dst": "seed/transaction-move"}, {"op": "unknown", "path": "seed/late"}]},
 ] + fresh_unsafe_bundles())
-def test_unsafe_bundles_reject_without_partial_writes(bundle: dict):
-    """Unsafe paths, links, metadata, and late failures require non-zero rejection with an unchanged target."""
+def test_unsafe_bundles_reject_without_partial_writes(bundle: dict, fallback: bool):
+    """Unsafe paths and late failures stay rejected even when the fallback path is forced."""
     if TARGET.exists():
         shutil.rmtree(TARGET)
     canary = Path(tempfile.mkdtemp(prefix="outside-canary-"))
     try:
         initial_tree(TARGET, canary)
         before = tree_snapshot(TARGET)
-        result = run_bundle(bundle)
+        result = run_bundle(bundle, fallback=fallback)
         assert result.returncode != 0
         assert tree_snapshot(TARGET) == before
         assert not list(canary.iterdir())
