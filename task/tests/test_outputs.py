@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import random
+import secrets
 import shutil
 import stat
 import subprocess
@@ -261,6 +262,34 @@ def fresh_generated_valid_bundles() -> list[dict]:
     return bundles
 
 
+def runtime_generated_valid_bundles() -> list[dict]:
+    """Use an unpredictable namespace while keeping the modeled outcome exact."""
+    nonce = secrets.token_hex(8)
+    serial = int(nonce, 16)
+    root = f"txn-{nonce}"
+    incoming = f"incoming-{nonce}"
+    outgoing = f"outgoing-{nonce}"
+    payload = f"payload-{nonce}"
+    alias = f"alias-{nonce}"
+    moved = f"moved-{nonce}"
+    stamp = 1_700_020_000_000_000_000 + serial % 1_000_000_000
+    uid = 1200 + serial % 97
+    gid = 1300 + serial % 89
+    return [{"format": 1, "operations": [
+        {"op": "mkdir", "path": root, "mode": 0o755},
+        {"op": "mkdir", "path": f"{root}/{incoming}", "mode": 0o750},
+        {"op": "mkdir", "path": f"{root}/{outgoing}", "mode": 0o1777},
+        {"op": "write", "path": f"{root}/{incoming}/{payload}", "data_b64": enc(f"old-{nonce}".encode()), "mode": 0o640, "uid": uid, "gid": gid, "mtime_ns": stamp, "xattrs": {"user.runtime": enc(nonce.encode())}},
+        {"op": "hardlink", "path": f"{root}/{outgoing}/{alias}", "target": f"{root}/{incoming}/{payload}"},
+        {"op": "rename", "src": f"{root}/{outgoing}/{alias}", "dst": f"{root}/{outgoing}/{moved}", "mode": 0o600, "mtime_ns": stamp + 1},
+        {"op": "write", "path": f"{root}/{incoming}/{payload}", "data_b64": enc(f"new-{nonce}".encode()), "mode": 0o644, "mtime_ns": stamp + 2, "xattrs": {"user.replaced": enc(b"fresh-inode")}},
+        {"op": "symlink", "path": f"{root}/current", "target": f"{outgoing}/{moved}"},
+        {"op": "mkdir", "path": f"{root}/discard", "mode": 0o755},
+        {"op": "write", "path": f"{root}/discard/temporary", "data_b64": enc(b"discard")},
+        {"op": "whiteout", "path": f"{root}/discard"},
+    ]}]
+
+
 def fresh_unsafe_bundles() -> list[dict]:
     """Generate additional rejection combinations without literal fixture names."""
     bundles = []
@@ -272,6 +301,27 @@ def fresh_unsafe_bundles() -> list[dict]:
             {"op": "write", "path": f"seed/{link}/child", "data_b64": enc(b"x")},
         ]})
     return bundles
+
+
+def runtime_parent_rejection_bundles() -> list[dict]:
+    """Exercise missing, non-directory, and created-symlink parents under fresh names."""
+    nonce = secrets.token_hex(8)
+    missing = f"missing-{nonce}"
+    regular = f"regular-{nonce}"
+    link = f"link-{nonce}"
+    return [
+        {"format": 1, "operations": [
+            {"op": "write", "path": f"{missing}/child", "data_b64": enc(b"x")},
+        ]},
+        {"format": 1, "operations": [
+            {"op": "write", "path": f"seed/{regular}", "data_b64": enc(b"parent-is-file")},
+            {"op": "write", "path": f"seed/{regular}/child", "data_b64": enc(b"x")},
+        ]},
+        {"format": 1, "operations": [
+            {"op": "symlink", "path": f"seed/{link}", "target": "keep.txt"},
+            {"op": "write", "path": f"seed/{link}/child", "data_b64": enc(b"x")},
+        ]},
+    ]
 
 
 def expected_for(bundle: dict, fallback_root: Path) -> dict[str, tuple]:
@@ -323,7 +373,7 @@ def test_repaired_program_is_the_declared_artifact():
 @pytest.mark.parametrize("fallback", [False, True])
 def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
     """Valid bundles must reproduce complete tree, metadata, whiteout, opaque, and link semantics in both modes."""
-    for index, bundle in enumerate(valid_bundles() + generated_valid_bundles() + fresh_generated_valid_bundles()):
+    for index, bundle in enumerate(valid_bundles() + generated_valid_bundles() + fresh_generated_valid_bundles() + runtime_generated_valid_bundles()):
         copy_initial(TARGET)
         with tempfile.TemporaryDirectory(prefix="expected-") as expected_dir:
             expected_root = Path(expected_dir) / "target"
@@ -359,7 +409,7 @@ def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
     {"format": 1, "operations": [{"op": "hardlink", "path": "seed/bad-link", "target": "seed/keep.txt", "xattrs": {"security.capability": enc(b"x")}}]},
     {"format": 1, "operations": [{"op": "rename", "src": "seed/old.txt", "dst": "seed/bad-move", "mode": 0o4755}]},
     {"format": 1, "operations": [{"op": "hardlink", "path": "seed/transaction-link", "target": "seed/keep.txt", "mode": 0o600}, {"op": "rename", "src": "seed/old.txt", "dst": "seed/transaction-move"}, {"op": "unknown", "path": "seed/late"}]},
-] + fresh_unsafe_bundles())
+] + fresh_unsafe_bundles() + runtime_parent_rejection_bundles())
 def test_unsafe_bundles_reject_without_partial_writes(bundle: dict, fallback: bool):
     """Unsafe paths and late failures stay rejected even when the fallback path is forced."""
     if TARGET.exists():

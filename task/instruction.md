@@ -6,7 +6,7 @@ It must also accept `--force-fallback`; the verifier uses that flag to exercise 
 
 The bundle is JSON with `format: 1` and an ordered `operations` array. Paths are canonical slash-separated paths relative to the target root: they may not be empty, absolute, contain NUL, `..`, `.`, or empty components. Operations are applied in order:
 
-The canonical semantics below, rather than quirks of the intentionally unsafe starter, define the answer. The verifier independently constructs expected trees from these rules and uses fresh operation names, orderings, metadata, and attack combinations; valid behavior must generalize beyond the visible sample. It also forces `--force-fallback` while replaying the rejection corpus, including non-empty operations beneath attacker-created symlink components, so a fallback implementation must perform the same per-component no-following traversal and atomic rejection as any optional fast path.
+The canonical semantics below, rather than quirks of the intentionally unsafe starter, define the answer. The verifier independently constructs expected trees from these rules and uses per-run fresh operation names, orderings, metadata, and attack combinations; valid behavior must generalize beyond the visible sample. It also forces `--force-fallback` while replaying the rejection corpus, including non-empty operations beneath attacker-created symlink components. A fallback implementation must retain the same no-following and atomic-rejection guarantees as any optional fast path, whether by descriptor-relative per-component traversal or by applying operations only in an attacker-inaccessible private stage before commit.
 
 
 - `mkdir` creates or updates a directory.
