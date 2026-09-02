@@ -10,10 +10,10 @@ The canonical semantics below, rather than quirks of the intentionally unsafe st
 
 
 - `mkdir` creates or updates a directory.
-- `write` creates or replaces a regular file; its `data_b64` value is base64 content.
+- `write` creates or replaces a regular file; its `data_b64` value is base64 content. Replacing a non-directory object replaces that directory entry with a fresh file and must not follow a pre-existing symlink or alter unrelated hardlink names.
 - `symlink` creates an inert symbolic link. Its `target` is link text and must never be followed while applying the bundle.
-- `hardlink` creates `path` as a hardlink to an already-existing regular-file `target` in the root.
-- `rename` moves `src` to `dst`; both names must remain in the root.
+- `hardlink` creates `path` as a hardlink to an already-existing regular-file `target` in the root; metadata on the new name applies to the shared inode and is therefore visible through every alias.
+- `rename` moves `src` to `dst`; both names must remain in the root, and it rejects if `dst` already exists.
 - `unlink` removes one existing object, and succeeds if the object is already absent.
 - `whiteout` removes the named object recursively, including a directory and all descendants.
 - `opaque` requires an existing directory and removes its children while preserving the directory itself.

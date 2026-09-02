@@ -98,6 +98,10 @@ def model_apply(root: Path, operations: list[dict]) -> None:
                 path.mkdir()
         elif kind == "write":
             path = root / op["path"]
+            if os.path.lexists(path):
+                if path.is_dir() and not path.is_symlink():
+                    raise AssertionError("write over directory")
+                path.unlink()
             path.write_bytes(base64.b64decode(op["data_b64"]))
         elif kind == "symlink":
             path = root / op["path"]
@@ -204,6 +208,14 @@ def generated_valid_bundles() -> list[dict]:
             {"op": "mkdir", "path": f"{second}/tree", "mode": 0o1777},
             {"op": "write", "path": f"{second}/tree/file2", "data_b64": enc(b"after")},
         ]},
+        {"format": 1, "operations": [
+            {"op": "mkdir", "path": third, "mode": 0o755},
+            {"op": "hardlink", "path": f"{third}/linked", "target": "seed/keep.txt", "mode": 0o600, "mtime_ns": 1_700_001_004_000_000_000, "xattrs": {"user.link": enc(b"shared")}},
+            {"op": "write", "path": "seed/keep-alias.txt", "data_b64": enc(b"replacement"), "mode": 0o640},
+            {"op": "rename", "src": f"{third}/linked", "dst": f"{third}/moved"},
+            {"op": "write", "path": f"{third}/new", "data_b64": enc(b"new-object")},
+            {"op": "mkdir", "path": "seed", "mode": 0o755, "mtime_ns": 1_700_001_005_000_000_000},
+        ]},
     ]
 
 
@@ -275,6 +287,8 @@ def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
     {"format": 1, "operations": [{"op": "write", "path": "", "data_b64": enc(b"x")}]},
     {"format": 1, "operations": [{"op": "write", "path": "a/", "data_b64": enc(b"x")}]},
     {"format": 1, "operations": [{"op": "write", "path": "a\0b", "data_b64": enc(b"x")}]},
+    {"format": 1, "operations": [{"op": "symlink", "path": "seed/created-link", "target": "keep.txt"}, {"op": "write", "path": "seed/created-link/child", "data_b64": enc(b"x")}]},
+    {"format": 1, "operations": [{"op": "rename", "src": "seed/old.txt", "dst": "seed/keep.txt"}]},
     {"format": 1, "operations": [{"op": "hardlink", "path": "seed/out", "target": "seed/link"}]},
     {"format": 1, "operations": [{"op": "write", "path": "seed/partial", "data_b64": enc(b"x")}, {"op": "unknown", "path": "seed/no"}]},
     {"format": 1, "operations": [{"op": "write", "path": "seed/bad", "data_b64": enc(b"x"), "mode": 0o4755}]},
@@ -283,6 +297,7 @@ def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
     {"format": 1, "operations": [{"op": "symlink", "path": "seed/bad-link", "target": "keep.txt", "mode": 0o4755}]},
     {"format": 1, "operations": [{"op": "hardlink", "path": "seed/bad-link", "target": "seed/keep.txt", "xattrs": {"security.capability": enc(b"x")}}]},
     {"format": 1, "operations": [{"op": "rename", "src": "seed/old.txt", "dst": "seed/bad-move", "mode": 0o4755}]},
+    {"format": 1, "operations": [{"op": "hardlink", "path": "seed/transaction-link", "target": "seed/keep.txt", "mode": 0o600}, {"op": "rename", "src": "seed/old.txt", "dst": "seed/transaction-move"}, {"op": "unknown", "path": "seed/late"}]},
 ])
 def test_unsafe_bundles_reject_without_partial_writes(bundle: dict):
     """Unsafe paths, links, metadata, and late failures require non-zero rejection with an unchanged target."""
