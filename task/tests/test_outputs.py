@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import random
 import shutil
 import stat
 import subprocess
@@ -28,6 +29,7 @@ def initial_tree(root: Path, canary: Path | None = None) -> None:
     (root / "seed" / "sub").mkdir(parents=True)
     (root / "seed" / "keep.txt").write_bytes(b"keep-this")
     (root / "seed" / "old.txt").write_bytes(b"old-data")
+    os.link(root / "seed" / "keep.txt", root / "seed" / "keep-alias.txt")
     (root / "seed" / "sub" / "nested.txt").write_bytes(b"nested")
     os.chmod(root / "seed", 0o755)
     os.chmod(root / "seed" / "keep.txt", 0o640)
@@ -172,6 +174,39 @@ def valid_bundles() -> list[dict]:
     ]
 
 
+def generated_valid_bundles() -> list[dict]:
+    """Generate fresh-looking valid bundles so behavior cannot be keyed to sample names."""
+    names = ["amber", "cobalt", "juniper", "lattice", "quartz", "saffron"]
+    random.Random(0xD17A5E).shuffle(names)
+    first, second, third = names[:3]
+    return [
+        {"format": 1, "operations": [
+            {"op": "mkdir", "path": first, "mode": 0o755},
+            {"op": "mkdir", "path": f"{first}/{second}", "mode": 0o1777, "uid": 1001, "gid": 1002},
+            {"op": "write", "path": f"{first}/{second}/{third}", "data_b64": enc(b"generated-a"), "xattrs": {"user.role": enc(b"runtime")}},
+            {"op": "hardlink", "path": f"{first}/{second}/{third}-alias", "target": f"{first}/{second}/{third}"},
+            {"op": "rename", "src": f"{first}/{second}/{third}-alias", "dst": f"{first}/{second}/moved", "mode": 0o640, "mtime_ns": 1_700_001_002_000_000_000},
+            {"op": "symlink", "path": f"{first}/current", "target": f"{second}/{third}"},
+            {"op": "unlink", "path": "seed/old.txt"},
+            {"op": "mkdir", "path": f"{first}/empty", "mode": 0o755},
+            {"op": "opaque", "path": f"{first}/{second}"},
+            {"op": "write", "path": f"{first}/{second}/after", "data_b64": enc(b"generated-b"), "mode": 0o600},
+            {"op": "mkdir", "path": first, "mode": 0o755, "mtime_ns": 1_700_001_001_000_000_000},
+            {"op": "mkdir", "path": "seed", "mode": 0o755, "mtime_ns": 1_700_001_003_000_000_000},
+        ]},
+        {"format": 1, "operations": [
+            {"op": "mkdir", "path": second, "mode": 0o755},
+            {"op": "write", "path": f"{second}/old", "data_b64": enc(b"old")},
+            {"op": "whiteout", "path": f"{second}/old"},
+            {"op": "mkdir", "path": f"{second}/tree", "mode": 0o755},
+            {"op": "write", "path": f"{second}/tree/file", "data_b64": enc(b"before")},
+            {"op": "whiteout", "path": f"{second}/tree"},
+            {"op": "mkdir", "path": f"{second}/tree", "mode": 0o1777},
+            {"op": "write", "path": f"{second}/tree/file2", "data_b64": enc(b"after")},
+        ]},
+    ]
+
+
 def expected_for(bundle: dict, fallback_root: Path) -> dict[str, tuple]:
     initial_tree(fallback_root)
     model_apply(fallback_root, bundle["operations"])
@@ -216,7 +251,7 @@ def test_repaired_program_is_the_declared_artifact():
 @pytest.mark.parametrize("fallback", [False, True])
 def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
     """Valid bundles must reproduce complete tree, metadata, whiteout, opaque, and link semantics in both modes."""
-    for index, bundle in enumerate(valid_bundles()):
+    for index, bundle in enumerate(valid_bundles() + generated_valid_bundles()):
         copy_initial(TARGET)
         with tempfile.TemporaryDirectory(prefix="expected-") as expected_dir:
             expected_root = Path(expected_dir) / "target"
@@ -234,6 +269,12 @@ def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
     {"format": 1, "operations": [{"op": "write", "path": "../escape", "data_b64": enc(b"x")}]},
     {"format": 1, "operations": [{"op": "write", "path": "/absolute", "data_b64": enc(b"x")}]},
     {"format": 1, "operations": [{"op": "write", "path": "pivot/out", "data_b64": enc(b"x")}]},
+    {"format": 1, "operations": [{"op": "write", "path": "missing/child", "data_b64": enc(b"x")}]},
+    {"format": 1, "operations": [{"op": "write", "path": "a/./b", "data_b64": enc(b"x")}]},
+    {"format": 1, "operations": [{"op": "write", "path": "a//b", "data_b64": enc(b"x")}]},
+    {"format": 1, "operations": [{"op": "write", "path": "", "data_b64": enc(b"x")}]},
+    {"format": 1, "operations": [{"op": "write", "path": "a/", "data_b64": enc(b"x")}]},
+    {"format": 1, "operations": [{"op": "write", "path": "a\0b", "data_b64": enc(b"x")}]},
     {"format": 1, "operations": [{"op": "hardlink", "path": "seed/out", "target": "seed/link"}]},
     {"format": 1, "operations": [{"op": "write", "path": "seed/partial", "data_b64": enc(b"x")}, {"op": "unknown", "path": "seed/no"}]},
     {"format": 1, "operations": [{"op": "write", "path": "seed/bad", "data_b64": enc(b"x"), "mode": 0o4755}]},
@@ -273,12 +314,28 @@ def test_invalid_json_and_root_symlink_are_rejected():
         link_root.unlink(missing_ok=True)
         link_root.symlink_to(TARGET)
         try:
-            result = run_bundle({"format": 1, "operations": []}, root=link_root)
+            result = run_bundle({"format": 1, "operations": [{"op": "write", "path": "probe", "data_b64": enc(b"must-not-write")}]}, root=link_root)
             assert result.returncode != 0
+            assert tree_snapshot(TARGET) == original
         finally:
             link_root.unlink(missing_ok=True)
     finally:
         bad.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("bundle", [
+    {"format": 2, "operations": []},
+    {"format": 1, "operations": {}},
+    {"format": 1, "operations": [{"op": "write", "path": "seed/bad", "data_b64": "%%%"}]},
+    {"format": 1, "operations": [{"op": "write", "path": "seed/bad", "data_b64": enc(b"x"), "xattrs": []}]},
+])
+def test_malformed_bundles_reject_without_writes(bundle: dict):
+    """Schema and metadata-shape errors must be rejected atomically."""
+    copy_initial(TARGET)
+    before = tree_snapshot(TARGET)
+    result = run_bundle(bundle)
+    assert result.returncode != 0
+    assert tree_snapshot(TARGET) == before
 
 
 def test_path_swap_race_has_zero_canary_violations_across_64_runs():

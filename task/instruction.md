@@ -6,6 +6,8 @@ It must also accept `--force-fallback`; the verifier uses that flag to exercise 
 
 The bundle is JSON with `format: 1` and an ordered `operations` array. Paths are canonical slash-separated paths relative to the target root: they may not be empty, absolute, contain NUL, `..`, `.`, or empty components. Operations are applied in order:
 
+The canonical semantics below, rather than quirks of the intentionally unsafe starter, define the answer. The verifier independently constructs expected trees from these rules and uses fresh operation names, orderings, metadata, and attack combinations; valid behavior must generalize beyond the visible sample.
+
 - `mkdir` creates or updates a directory.
 - `write` creates or replaces a regular file; its `data_b64` value is base64 content.
 - `symlink` creates an inert symbolic link. Its `target` is link text and must never be followed while applying the bundle.

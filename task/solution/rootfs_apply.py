@@ -109,6 +109,26 @@ def remove_tree(path: Path, missing_ok: bool = False) -> None:
         path.unlink()
 
 
+def copy_tree_preserving_links(source: Path, destination: Path) -> None:
+    """Stage the root without silently splitting pre-existing regular-file links."""
+    copied: dict[tuple[int, int], Path] = {}
+
+    def copy_file(src: str, dst: str) -> str:
+        src_path = Path(src)
+        dst_path = Path(dst)
+        st = os.stat(src_path, follow_symlinks=False)
+        key = (st.st_dev, st.st_ino)
+        if stat.S_ISREG(st.st_mode) and key in copied:
+            os.link(copied[key], dst_path)
+            return str(dst_path)
+        result = shutil.copy2(src_path, dst_path, follow_symlinks=False)
+        if stat.S_ISREG(st.st_mode):
+            copied[key] = dst_path
+        return result
+
+    shutil.copytree(source, destination, symlinks=True, copy_function=copy_file)
+
+
 def apply_meta(path: Path, op: dict) -> None:
     if "uid" in op or "gid" in op:
         st = os.lstat(path)
@@ -196,7 +216,7 @@ def apply(root_name: str, bundle_name: str) -> None:
     shutil.rmtree(stage)
     backup = root.parent / (".rootfs-old-" + next(tempfile._get_candidate_names()))
     try:
-        shutil.copytree(root, stage, symlinks=True, copy_function=shutil.copy2)
+        copy_tree_preserving_links(root, stage)
         for op in doc["operations"]:
             apply_op(stage, op)
         os.rename(root, backup)
