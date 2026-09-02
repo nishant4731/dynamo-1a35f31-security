@@ -9,3 +9,5 @@ After each structural operation, metadata is applied in this exact order: `uid`/
 The existing implementation is intentionally unsafe. Preserve the benign semantics while making every operation confined to the target root, race resistant, and failure atomic. Rejection means non-zero exit and no target-tree change; stderr wording is deliberately not prescribed.
 
 The canonical semantics are the rules in this document, not incidental starter quirks. Expected trees are independently generated from this model, and verification includes fresh names, operation orderings, metadata combinations, malformed schemas, and non-empty operations through a symlink root.
+
+For implementation guidance, a qualified solution may validate the full bundle before writes, reject a symlink root with a no-follow check, stage in a sibling directory while preserving existing hardlink inode groups, use descriptor-relative no-follow traversal while applying operations, and atomically replace the target only after success. This single safe design may serve both normal and forced-fallback modes; no weaker fallback is acceptable.

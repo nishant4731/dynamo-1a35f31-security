@@ -8,6 +8,8 @@ The bundle is JSON with `format: 1` and an ordered `operations` array. Paths are
 
 The canonical semantics below, rather than quirks of the intentionally unsafe starter, define the answer. The verifier independently constructs expected trees from these rules and uses fresh operation names, orderings, metadata, and attack combinations; valid behavior must generalize beyond the visible sample.
 
+A viable implementation strategy is to validate the complete bundle first, reject the root argument itself if `lstat`/`O_NOFOLLOW` shows a symlink, copy the root into a sibling staging directory while preserving pre-existing hardlink inode groups, apply every operation there using no-following component traversal, and atomically swap the staged tree into place only after success. Discarding the stage on any error then provides the unchanged-target guarantee without a live-tree undo log. One always-safe descriptor-relative implementation is sufficient for both normal and `--force-fallback` modes; the fallback flag must not require a weaker or separately guessed security model.
+
 - `mkdir` creates or updates a directory.
 - `write` creates or replaces a regular file; its `data_b64` value is base64 content.
 - `symlink` creates an inert symbolic link. Its `target` is link text and must never be followed while applying the bundle.
