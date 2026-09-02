@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import random
@@ -20,10 +21,32 @@ import pytest
 APP = Path("/app/src/rootfs_apply.py")
 TARGET = Path("/app/target")
 CANARY_TARGET = "__VERIFIER_OUTSIDE_CANARY__"
+IMMUTABLE_INPUTS = {
+    Path("/app/fixtures/bundle.json"): "144ebe90ebdbaa5fbe6bbd151c5fd72be37658d39399bd728b1c81ffe752b4d0",
+    Path("/app/SECURITY_SPEC.md"): "b289688f6f6c3d561a7837ce5ac8e1efc70b4a255f3111e0a5a3111032bf488f",
+}
 
 
 def enc(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
+
+
+def nofollow_sha256(path: Path) -> str:
+    """Hash an immutable regular file without following any path symlink."""
+    current = Path(path.anchor)
+    for component in path.parts[1:-1]:
+        current /= component
+        st = os.lstat(current)
+        assert stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode), f"immutable input parent is not a real directory: {current}"
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        assert stat.S_ISREG(os.fstat(fd).st_mode), f"immutable input is not a regular file: {path}"
+        digest = hashlib.sha256()
+        while chunk := os.read(fd, 1024 * 1024):
+            digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
 
 
 def initial_tree(root: Path, canary: Path | None = None) -> None:
@@ -378,6 +401,12 @@ def test_repaired_program_is_the_declared_artifact():
         current /= component
         assert not current.is_symlink(), f"graded artifact path contains symlink: {current}"
     assert APP.resolve(strict=True) == APP.absolute()
+
+
+def test_immutable_agent_inputs_match_pinned_bytes_without_symlinks():
+    """The public fixture and semantics document must remain pristine after the agent run."""
+    for path, expected_digest in IMMUTABLE_INPUTS.items():
+        assert nofollow_sha256(path) == expected_digest, f"immutable input changed: {path}"
 
 
 @pytest.mark.parametrize("fallback", [False, True])
