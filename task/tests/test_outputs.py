@@ -219,6 +219,61 @@ def generated_valid_bundles() -> list[dict]:
     ]
 
 
+def fresh_generated_valid_bundles() -> list[dict]:
+    """Build deterministic but non-literal bundles from several independent seeds."""
+    bundles = []
+    for seed in (0xA11CE, 0xBADC0DE, 0xC0FFEE, 0xFACEFEED):
+        rng = random.Random(seed)
+        root = f"pkg-{rng.randrange(1000, 9999)}"
+        left = f"left-{rng.randrange(1000, 9999)}"
+        right = f"right-{rng.randrange(1000, 9999)}"
+        payload = f"payload-{rng.randrange(1000, 9999)}"
+        alias = f"alias-{rng.randrange(1000, 9999)}"
+        moved = f"moved-{rng.randrange(1000, 9999)}"
+        stamp = 1_700_010_000_000_000_000 + seed
+        children = [
+            {"op": "mkdir", "path": f"{root}/{left}", "mode": rng.choice([0o755, 0o750])},
+            {"op": "mkdir", "path": f"{root}/{right}", "mode": rng.choice([0o755, 0o755])},
+        ]
+        rng.shuffle(children)
+        independent_tail = [
+            {"op": "symlink", "path": f"{root}/current", "target": f"{left}/{payload}"},
+            {"op": "unlink", "path": "seed/old.txt"},
+        ]
+        rng.shuffle(independent_tail)
+        tail = [
+            *independent_tail,
+            {"op": "mkdir", "path": f"{root}/discard", "mode": 0o755},
+            {"op": "write", "path": f"{root}/discard/temporary", "data_b64": enc(b"discard-me")},
+            {"op": "whiteout", "path": f"{root}/discard"},
+            {"op": "mkdir", "path": "seed", "mode": 0o755, "mtime_ns": stamp},
+        ]
+        bundles.append({"format": 1, "operations": [
+            {"op": "mkdir", "path": root, "mode": 0o755},
+            *children,
+            {"op": "write", "path": f"{root}/{left}/{payload}", "data_b64": enc(f"payload-{seed}".encode()), "mode": rng.choice([0o600, 0o640]), "mtime_ns": stamp + 1, "xattrs": {"user.seed": enc(str(seed).encode())}},
+            {"op": "hardlink", "path": f"{root}/{right}/{alias}", "target": f"{root}/{left}/{payload}", "mode": 0o640, "mtime_ns": stamp + 2},
+            {"op": "rename", "src": f"{root}/{right}/{alias}", "dst": f"{root}/{right}/{moved}"},
+            {"op": "opaque", "path": f"{root}/{left}"},
+            {"op": "write", "path": f"{root}/{left}/after-opaque", "data_b64": enc(b"after-opaque"), "mode": 0o600},
+            *tail,
+        ]})
+    return bundles
+
+
+def fresh_unsafe_bundles() -> list[dict]:
+    """Generate additional rejection combinations without literal fixture names."""
+    bundles = []
+    for seed in (0x13579, 0x24680, 0xABCDE):
+        rng = random.Random(seed)
+        link = f"created-{rng.randrange(1000, 9999)}"
+        bundles.append({"format": 1, "operations": [
+            {"op": "symlink", "path": f"seed/{link}", "target": "keep.txt"},
+            {"op": "write", "path": f"seed/{link}/child", "data_b64": enc(b"x")},
+        ]})
+    return bundles
+
+
 def expected_for(bundle: dict, fallback_root: Path) -> dict[str, tuple]:
     initial_tree(fallback_root)
     model_apply(fallback_root, bundle["operations"])
@@ -268,7 +323,7 @@ def test_repaired_program_is_the_declared_artifact():
 @pytest.mark.parametrize("fallback", [False, True])
 def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
     """Valid bundles must reproduce complete tree, metadata, whiteout, opaque, and link semantics in both modes."""
-    for index, bundle in enumerate(valid_bundles() + generated_valid_bundles()):
+    for index, bundle in enumerate(valid_bundles() + generated_valid_bundles() + fresh_generated_valid_bundles()):
         copy_initial(TARGET)
         with tempfile.TemporaryDirectory(prefix="expected-") as expected_dir:
             expected_root = Path(expected_dir) / "target"
@@ -303,7 +358,7 @@ def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
     {"format": 1, "operations": [{"op": "hardlink", "path": "seed/bad-link", "target": "seed/keep.txt", "xattrs": {"security.capability": enc(b"x")}}]},
     {"format": 1, "operations": [{"op": "rename", "src": "seed/old.txt", "dst": "seed/bad-move", "mode": 0o4755}]},
     {"format": 1, "operations": [{"op": "hardlink", "path": "seed/transaction-link", "target": "seed/keep.txt", "mode": 0o600}, {"op": "rename", "src": "seed/old.txt", "dst": "seed/transaction-move"}, {"op": "unknown", "path": "seed/late"}]},
-])
+] + fresh_unsafe_bundles())
 def test_unsafe_bundles_reject_without_partial_writes(bundle: dict):
     """Unsafe paths, links, metadata, and late failures require non-zero rejection with an unchanged target."""
     if TARGET.exists():
