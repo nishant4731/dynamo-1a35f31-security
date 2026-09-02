@@ -24,8 +24,18 @@ CANARY_TARGET = "__VERIFIER_OUTSIDE_CANARY__"
 GENERATOR_SEED = b"rootfs-delta-hardening/submission-cohort/v1"
 IMMUTABLE_INPUTS = {
     Path("/app/fixtures/bundle.json"): "144ebe90ebdbaa5fbe6bbd151c5fd72be37658d39399bd728b1c81ffe752b4d0",
-    Path("/app/SECURITY_SPEC.md"): "a36d5e3205fb3b9f6dec808c3d6127ca917dac7b0a7ec1d27e30f3c8af31c76f",
+    Path("/app/SECURITY_SPEC.md"): "37c627c00a5291d9e56518f603b9f38ac4b4782d7631fa4f0a4bc51173a792b7",
 }
+
+
+@pytest.fixture(scope="session", autouse=True)
+def documented_verifier_umask():
+    """Pin the inherited creation mask to the documented value for every graded run."""
+    previous = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(previous)
 
 
 def enc(data: bytes) -> str:
@@ -164,7 +174,7 @@ def run_bundle(bundle: dict, *, fallback: bool = False, root: Path = TARGET, tim
 
 
 def model_apply(root: Path, operations: list[dict]) -> None:
-    """Independent path-based oracle for valid bundles only."""
+    """Independent final-state oracle for valid bundles, using one conforming metadata sequence."""
     for op in operations:
         kind = op["op"]
         if kind == "mkdir":
@@ -508,6 +518,8 @@ def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
         regular = {key: value[-1] for key, value in actual.items() if value[0] == stat.S_IFREG}
         if index == 0:
             assert regular["var/cache/blob"] == regular["var/cache/blob-renamed"]
+        if index == 1:
+            assert actual["seed/after-opaque"][1] == 0o644
 
 
 @pytest.mark.parametrize("fallback", [False, True])
@@ -524,6 +536,7 @@ def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
     {"format": 1, "operations": [{"op": "symlink", "path": "seed/created-link", "target": "keep.txt"}, {"op": "write", "path": "seed/created-link/child", "data_b64": enc(b"x")}]},
     {"format": 1, "operations": [{"op": "rename", "src": "seed/old.txt", "dst": "seed/keep.txt"}]},
     {"format": 1, "operations": [{"op": "hardlink", "path": "seed/out", "target": "seed/link"}]},
+    {"format": 1, "operations": [{"op": "hardlink", "path": "seed/keep.txt", "target": "seed/old.txt"}]},
     {"format": 1, "operations": [{"op": "write", "path": "seed/sub", "data_b64": enc(b"file-over-directory")}]},
     {"format": 1, "operations": [{"op": "mkdir", "path": "seed/old.txt"}]},
     {"format": 1, "operations": [{"op": "mkdir", "path": "seed/link"}]},
