@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
 import json
 import os
 import random
-import secrets
 import shutil
 import stat
 import subprocess
@@ -21,9 +21,10 @@ import pytest
 APP = Path("/app/src/rootfs_apply.py")
 TARGET = Path("/app/target")
 CANARY_TARGET = "__VERIFIER_OUTSIDE_CANARY__"
+GENERATOR_SEED = b"rootfs-delta-hardening/submission-cohort/v1"
 IMMUTABLE_INPUTS = {
     Path("/app/fixtures/bundle.json"): "144ebe90ebdbaa5fbe6bbd151c5fd72be37658d39399bd728b1c81ffe752b4d0",
-    Path("/app/SECURITY_SPEC.md"): "b289688f6f6c3d561a7837ce5ac8e1efc70b4a255f3111e0a5a3111032bf488f",
+    Path("/app/SECURITY_SPEC.md"): "29fe4980029f5c782ac8a01cc42a28e9af1db9fea1b85ca4a6e624584d0e6bb7",
 }
 
 
@@ -38,7 +39,9 @@ def nofollow_sha256(path: Path) -> str:
         current /= component
         st = os.lstat(current)
         assert stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode), f"immutable input parent is not a real directory: {current}"
-    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    terminal = os.lstat(path)
+    assert stat.S_ISREG(terminal.st_mode), f"immutable input is not a regular file: {path}"
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         assert stat.S_ISREG(os.fstat(fd).st_mode), f"immutable input is not a regular file: {path}"
         digest = hashlib.sha256()
@@ -47,6 +50,18 @@ def nofollow_sha256(path: Path) -> str:
         return digest.hexdigest()
     finally:
         os.close(fd)
+
+
+@functools.cache
+def submitted_artifact_digest() -> str:
+    """Pin the cohort to one no-follow read of the submitted artifact."""
+    return nofollow_sha256(APP)
+
+
+def submission_rng(domain: str) -> random.Random:
+    """Return a deterministic, domain-separated RNG for this exact submission."""
+    material = b"\0".join((GENERATOR_SEED, domain.encode("ascii"), bytes.fromhex(submitted_artifact_digest())))
+    return random.Random(int.from_bytes(hashlib.sha256(material).digest(), "big"))
 
 
 def initial_tree(root: Path, canary: Path | None = None) -> None:
@@ -290,9 +305,9 @@ def fresh_generated_valid_bundles() -> list[dict]:
     return bundles
 
 
-def runtime_generated_valid_bundles() -> list[dict]:
-    """Use an unpredictable namespace while keeping the modeled outcome exact."""
-    nonce = secrets.token_hex(8)
+def submission_generated_valid_bundles() -> list[dict]:
+    """Use a deterministic per-submission namespace while keeping modeled outcomes exact."""
+    nonce = f"{submission_rng('valid-v1').getrandbits(64):016x}"
     serial = int(nonce, 16)
     root = f"txn-{nonce}"
     incoming = f"incoming-{nonce}"
@@ -331,9 +346,9 @@ def fresh_unsafe_bundles() -> list[dict]:
     return bundles
 
 
-def runtime_parent_rejection_bundles() -> list[dict]:
-    """Exercise missing, non-directory, and created-symlink parents under fresh names."""
-    nonce = secrets.token_hex(8)
+def submission_parent_rejection_bundles() -> list[dict]:
+    """Exercise unsafe parents under a deterministic per-submission namespace."""
+    nonce = f"{submission_rng('unsafe-parent-v1').getrandbits(64):016x}"
     missing = f"missing-{nonce}"
     regular = f"regular-{nonce}"
     link = f"link-{nonce}"
@@ -409,10 +424,16 @@ def test_immutable_agent_inputs_match_pinned_bytes_without_symlinks():
         assert nofollow_sha256(path) == expected_digest, f"immutable input changed: {path}"
 
 
+def test_submission_derived_generators_are_reproducible():
+    """Identical submitted bytes must always produce an identical graded cohort."""
+    assert submission_generated_valid_bundles() == submission_generated_valid_bundles()
+    assert submission_parent_rejection_bundles() == submission_parent_rejection_bundles()
+
+
 @pytest.mark.parametrize("fallback", [False, True])
 def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
     """Valid bundles must reproduce complete tree, metadata, whiteout, opaque, and link semantics in both modes."""
-    for index, bundle in enumerate(valid_bundles() + generated_valid_bundles() + fresh_generated_valid_bundles() + runtime_generated_valid_bundles()):
+    for index, bundle in enumerate(valid_bundles() + generated_valid_bundles() + fresh_generated_valid_bundles() + submission_generated_valid_bundles()):
         copy_initial(TARGET)
         with tempfile.TemporaryDirectory(prefix="expected-") as expected_dir:
             expected_root = Path(expected_dir) / "target"
@@ -453,7 +474,7 @@ def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
     {"format": 1, "operations": [{"op": "hardlink", "path": "seed/bad-link", "target": "seed/keep.txt", "xattrs": {"security.capability": enc(b"x")}}]},
     {"format": 1, "operations": [{"op": "rename", "src": "seed/old.txt", "dst": "seed/bad-move", "mode": 0o4755}]},
     {"format": 1, "operations": [{"op": "hardlink", "path": "seed/transaction-link", "target": "seed/keep.txt", "mode": 0o600}, {"op": "rename", "src": "seed/old.txt", "dst": "seed/transaction-move"}, {"op": "unknown", "path": "seed/late"}]},
-] + fresh_unsafe_bundles() + runtime_parent_rejection_bundles())
+] + fresh_unsafe_bundles() + submission_parent_rejection_bundles())
 def test_unsafe_bundles_reject_without_partial_writes(bundle: dict, fallback: bool):
     """Unsafe paths and late failures stay rejected even when the fallback path is forced."""
     if TARGET.exists():
