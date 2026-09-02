@@ -19,6 +19,7 @@ import pytest
 
 APP = Path("/app/src/rootfs_apply.py")
 TARGET = Path("/app/target")
+CANARY_TARGET = "__VERIFIER_OUTSIDE_CANARY__"
 
 
 def enc(data: bytes) -> str:
@@ -176,6 +177,10 @@ def valid_bundles() -> list[dict]:
             {"op": "unlink", "path": "seed/does-not-exist"},
             {"op": "mkdir", "path": "seed", "mode": 0o755, "mtime_ns": 1_700_000_103_000_000_000},
         ]},
+        {"format": 1, "operations": [
+            {"op": "write", "path": "seed/link", "data_b64": enc(b"terminal-symlink-replaced"), "mode": 0o600, "mtime_ns": 1_700_000_105_000_000_000, "xattrs": {"user.replacement": enc(b"fresh")}},
+            {"op": "mkdir", "path": "seed", "mode": 0o755, "mtime_ns": 1_700_000_103_000_000_000},
+        ]},
     ]
 
 
@@ -309,6 +314,7 @@ def runtime_parent_rejection_bundles() -> list[dict]:
     missing = f"missing-{nonce}"
     regular = f"regular-{nonce}"
     link = f"link-{nonce}"
+    escape_link = f"escape-{nonce}"
     return [
         {"format": 1, "operations": [
             {"op": "write", "path": f"{missing}/child", "data_b64": enc(b"x")},
@@ -320,6 +326,10 @@ def runtime_parent_rejection_bundles() -> list[dict]:
         {"format": 1, "operations": [
             {"op": "symlink", "path": f"seed/{link}", "target": "keep.txt"},
             {"op": "write", "path": f"seed/{link}/child", "data_b64": enc(b"x")},
+        ]},
+        {"format": 1, "operations": [
+            {"op": "symlink", "path": f"seed/{escape_link}", "target": CANARY_TARGET},
+            {"op": "write", "path": f"seed/{escape_link}/outside-write", "data_b64": enc(b"must-not-escape")},
         ]},
     ]
 
@@ -401,6 +411,11 @@ def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
     {"format": 1, "operations": [{"op": "symlink", "path": "seed/created-link", "target": "keep.txt"}, {"op": "write", "path": "seed/created-link/child", "data_b64": enc(b"x")}]},
     {"format": 1, "operations": [{"op": "rename", "src": "seed/old.txt", "dst": "seed/keep.txt"}]},
     {"format": 1, "operations": [{"op": "hardlink", "path": "seed/out", "target": "seed/link"}]},
+    {"format": 1, "operations": [{"op": "write", "path": "seed/sub", "data_b64": enc(b"file-over-directory")}]},
+    {"format": 1, "operations": [{"op": "mkdir", "path": "seed/old.txt"}]},
+    {"format": 1, "operations": [{"op": "mkdir", "path": "seed/link"}]},
+    {"format": 1, "operations": [{"op": "opaque", "path": "seed/old.txt"}]},
+    {"format": 1, "operations": [{"op": "symlink", "path": "seed/sub", "target": "elsewhere"}]},
     {"format": 1, "operations": [{"op": "write", "path": "seed/partial", "data_b64": enc(b"x")}, {"op": "unknown", "path": "seed/no"}]},
     {"format": 1, "operations": [{"op": "write", "path": "seed/bad", "data_b64": enc(b"x"), "mode": 0o4755}]},
     {"format": 1, "operations": [{"op": "write", "path": "seed/bad", "data_b64": enc(b"x"), "xattrs": {"security.capability": enc(b"x")}}]},
@@ -418,7 +433,11 @@ def test_unsafe_bundles_reject_without_partial_writes(bundle: dict, fallback: bo
     try:
         initial_tree(TARGET, canary)
         before = tree_snapshot(TARGET)
-        result = run_bundle(bundle, fallback=fallback)
+        prepared = json.loads(json.dumps(bundle))
+        for op in prepared["operations"]:
+            if op.get("target") == CANARY_TARGET:
+                op["target"] = str(canary)
+        result = run_bundle(prepared, fallback=fallback)
         assert result.returncode != 0
         assert tree_snapshot(TARGET) == before
         assert not list(canary.iterdir())

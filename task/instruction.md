@@ -9,10 +9,10 @@ The bundle is JSON with `format: 1` and an ordered `operations` array. Paths are
 The canonical semantics below, rather than quirks of the intentionally unsafe starter, define the answer. The verifier independently constructs expected trees from these rules and uses per-run fresh operation names, orderings, metadata, and attack combinations; valid behavior must generalize beyond the visible sample. It also forces `--force-fallback` while replaying the rejection corpus, including non-empty operations beneath attacker-created symlink components. A fallback implementation must retain the same no-following and atomic-rejection guarantees as any optional fast path, whether by descriptor-relative per-component traversal or by applying operations only in an attacker-inaccessible private stage before commit.
 
 
-- `mkdir` creates or updates a directory.
-- `write` creates or replaces a regular file; its `data_b64` value is base64 content. Replacing a non-directory object replaces that directory entry with a fresh file and must not follow a pre-existing symlink or alter unrelated hardlink names.
-- `symlink` creates an inert symbolic link. Its `target` is link text and must never be followed while applying the bundle.
-- `hardlink` creates `path` as a hardlink to an already-existing regular-file `target` in the root; metadata on the new name applies to the shared inode and is therefore visible through every alias.
+- `mkdir` creates or updates a directory and rejects an existing non-directory at `path`.
+- `write` creates or replaces a regular file and rejects an existing directory; its `data_b64` value is base64 content. Replacing a non-directory object, including a terminal symlink, replaces that directory entry with a fresh file and must not follow the old symlink or alter unrelated hardlink names.
+- `symlink` creates an inert symbolic link, replacing an existing non-directory entry but rejecting an existing directory. Its `target` is link text and must never be followed while applying the bundle.
+- `hardlink` creates `path` as a hardlink to an already-existing regular-file `target` in the root and rejects an existing destination; metadata on the new name applies to the shared inode and is therefore visible through every alias.
 - `rename` moves `src` to `dst`; both names must remain in the root, and it rejects if `dst` already exists.
 - `unlink` removes one existing object, and succeeds if the object is already absent.
 - `whiteout` removes the named object recursively, including a directory and all descendants.
