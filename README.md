@@ -14,4 +14,4 @@ The single pinned Python image contains the visible vulnerable source, semantic 
 
 ## Verification
 
-Tests use reproducible, submission-namespaced cohorts and compare complete filesystem trees, bytes, types, hardlink identity, modes, ownership, nanosecond timestamps, and `user.*` xattrs. Unsafe bundles must return non-zero with no partial change, and 64 race runs must produce zero outside-canary violations. The reference solution earns 1.0 and the no-op agent fails.
+Tests use reproducible, submission-namespaced cohorts and compare complete filesystem trees, bytes, types, hardlink identity, modes, ownership, nanosecond timestamps, and `user.*` xattrs. Unsafe bundles—including hardlink-source and destructive-operation traversal through created symlink parents—must return non-zero while preserving exact inside and populated outside-canary snapshots in normal and forced-fallback modes. A 64-run race harness must produce zero canary violations. The reference solution earns 1.0 and the no-op agent fails.

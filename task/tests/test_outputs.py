@@ -24,7 +24,7 @@ CANARY_TARGET = "__VERIFIER_OUTSIDE_CANARY__"
 GENERATOR_SEED = b"rootfs-delta-hardening/submission-cohort/v1"
 IMMUTABLE_INPUTS = {
     Path("/app/fixtures/bundle.json"): "144ebe90ebdbaa5fbe6bbd151c5fd72be37658d39399bd728b1c81ffe752b4d0",
-    Path("/app/SECURITY_SPEC.md"): "29fe4980029f5c782ac8a01cc42a28e9af1db9fea1b85ca4a6e624584d0e6bb7",
+    Path("/app/SECURITY_SPEC.md"): "a36d5e3205fb3b9f6dec808c3d6127ca917dac7b0a7ec1d27e30f3c8af31c76f",
 }
 
 
@@ -82,6 +82,25 @@ def initial_tree(root: Path, canary: Path | None = None) -> None:
         (root / "pivot").symlink_to(canary)
 
 
+def populate_canary(canary: Path) -> None:
+    """Create external objects that every path-bearing operation could corrupt."""
+    (canary / "outside-source").write_bytes(b"outside-source-must-not-change")
+    (canary / "victim-dir" / "nested").mkdir(parents=True)
+    (canary / "victim-dir" / "keep.txt").write_bytes(b"keep-outside-tree")
+    (canary / "victim-dir" / "nested" / "leaf.txt").write_bytes(b"keep-outside-leaf")
+    os.chmod(canary / "outside-source", 0o640)
+    os.chmod(canary / "victim-dir", 0o750)
+    fixed = 1_700_030_000_000_000_000
+    for path in (
+        canary / "outside-source",
+        canary / "victim-dir" / "keep.txt",
+        canary / "victim-dir" / "nested" / "leaf.txt",
+        canary / "victim-dir" / "nested",
+        canary / "victim-dir",
+    ):
+        os.utime(path, ns=(fixed, fixed), follow_symlinks=False)
+
+
 def tree_snapshot(root: Path) -> dict[str, tuple]:
     result: dict[str, tuple] = {}
     for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
@@ -108,6 +127,22 @@ def tree_snapshot(root: Path) -> dict[str, tuple]:
                 link_key = None
             result[rel] = (stat.S_IFMT(st.st_mode), mode, st.st_uid, st.st_gid, st.st_mtime_ns, body, tuple(xattrs), link_key)
     return result
+
+
+def outside_snapshot(root: Path) -> tuple[tuple, dict[str, tuple]]:
+    """Snapshot the canary directory itself as well as every descendant."""
+    st = os.lstat(root)
+    xattrs = []
+    try:
+        xattrs = [
+            (key, os.getxattr(root, key, follow_symlinks=False))
+            for key in sorted(os.listxattr(root, follow_symlinks=False))
+            if key.startswith("user.")
+        ]
+    except OSError:
+        pass
+    metadata = (stat.S_IFMT(st.st_mode), stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid, st.st_mtime_ns, tuple(xattrs))
+    return metadata, tree_snapshot(root)
 
 
 def copy_initial(root: Path) -> None:
@@ -347,12 +382,18 @@ def fresh_unsafe_bundles() -> list[dict]:
 
 
 def submission_parent_rejection_bundles() -> list[dict]:
-    """Exercise unsafe parents under a deterministic per-submission namespace."""
+    """Exercise every symlink-parent role under a deterministic submission namespace."""
     nonce = f"{submission_rng('unsafe-parent-v1').getrandbits(64):016x}"
     missing = f"missing-{nonce}"
     regular = f"regular-{nonce}"
     link = f"link-{nonce}"
     escape_link = f"escape-{nonce}"
+    escaped = f"seed/{escape_link}"
+    create_escape = {"op": "symlink", "path": escaped, "target": CANARY_TARGET}
+
+    def through_escape(operation: dict) -> dict:
+        return {"format": 1, "operations": [dict(create_escape), operation]}
+
     return [
         {"format": 1, "operations": [
             {"op": "write", "path": f"{missing}/child", "data_b64": enc(b"x")},
@@ -365,10 +406,32 @@ def submission_parent_rejection_bundles() -> list[dict]:
             {"op": "symlink", "path": f"seed/{link}", "target": "keep.txt"},
             {"op": "write", "path": f"seed/{link}/child", "data_b64": enc(b"x")},
         ]},
-        {"format": 1, "operations": [
-            {"op": "symlink", "path": f"seed/{escape_link}", "target": CANARY_TARGET},
-            {"op": "write", "path": f"seed/{escape_link}/outside-write", "data_b64": enc(b"must-not-escape")},
-        ]},
+        through_escape({
+            "op": "write", "path": f"{escaped}/outside-write", "data_b64": enc(b"must-not-escape"),
+        }),
+        through_escape({
+            "op": "mkdir", "path": f"{escaped}/outside-directory", "mode": 0o755,
+        }),
+        through_escape({
+            "op": "symlink", "path": f"{escaped}/outside-link", "target": "inert-text",
+        }),
+        through_escape({
+            "op": "hardlink", "path": f"seed/stolen-{nonce}", "target": f"{escaped}/outside-source",
+            "mode": 0o600, "mtime_ns": 1_700_030_001_000_000_000,
+            "xattrs": {"user.escape": enc(b"must-not-touch-source")},
+        }),
+        through_escape({
+            "op": "hardlink", "path": f"{escaped}/outside-hardlink", "target": "seed/keep.txt",
+        }),
+        through_escape({"op": "unlink", "path": f"{escaped}/outside-source"}),
+        through_escape({"op": "whiteout", "path": f"{escaped}/victim-dir"}),
+        through_escape({"op": "opaque", "path": f"{escaped}/victim-dir"}),
+        through_escape({
+            "op": "rename", "src": f"{escaped}/outside-source", "dst": f"seed/moved-in-{nonce}",
+        }),
+        through_escape({
+            "op": "rename", "src": "seed/old.txt", "dst": f"{escaped}/moved-out-{nonce}",
+        }),
     ]
 
 
@@ -476,13 +539,15 @@ def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
     {"format": 1, "operations": [{"op": "hardlink", "path": "seed/transaction-link", "target": "seed/keep.txt", "mode": 0o600}, {"op": "rename", "src": "seed/old.txt", "dst": "seed/transaction-move"}, {"op": "unknown", "path": "seed/late"}]},
 ] + fresh_unsafe_bundles() + submission_parent_rejection_bundles())
 def test_unsafe_bundles_reject_without_partial_writes(bundle: dict, fallback: bool):
-    """Unsafe paths and late failures stay rejected even when the fallback path is forced."""
+    """Unsafe paths reject atomically without changing either root or populated outside canary."""
     if TARGET.exists():
         shutil.rmtree(TARGET)
-    canary = Path(tempfile.mkdtemp(prefix="outside-canary-"))
+    canary = Path(tempfile.mkdtemp(prefix=".outside-canary-", dir=TARGET.parent))
     try:
+        populate_canary(canary)
         initial_tree(TARGET, canary)
         before = tree_snapshot(TARGET)
+        outside_before = outside_snapshot(canary)
         prepared = json.loads(json.dumps(bundle))
         for op in prepared["operations"]:
             if op.get("target") == CANARY_TARGET:
@@ -490,7 +555,7 @@ def test_unsafe_bundles_reject_without_partial_writes(bundle: dict, fallback: bo
         result = run_bundle(prepared, fallback=fallback)
         assert result.returncode != 0
         assert tree_snapshot(TARGET) == before
-        assert not list(canary.iterdir())
+        assert outside_snapshot(canary) == outside_before
     finally:
         shutil.rmtree(canary, ignore_errors=True)
 
