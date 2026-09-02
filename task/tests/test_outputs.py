@@ -258,6 +258,11 @@ def comparable(actual: dict[str, tuple], expected: dict[str, tuple], bundle: dic
 def test_repaired_program_is_the_declared_artifact():
     """The agent must leave the repaired executable source at /app/src/rootfs_apply.py."""
     assert APP.is_file()
+    current = Path(APP.anchor)
+    for component in APP.parts[1:]:
+        current /= component
+        assert not current.is_symlink(), f"graded artifact path contains symlink: {current}"
+    assert APP.resolve(strict=True) == APP.absolute()
 
 
 @pytest.mark.parametrize("fallback", [False, True])
