@@ -82,6 +82,51 @@ def validate(doc: object) -> dict:
     return doc
 
 
+def audit_initial_tree(root: Path) -> None:
+    """Reject privilege-bearing objects and regular inodes linked outside root."""
+    counts: dict[tuple[int, int], int] = {}
+    declared_links: dict[tuple[int, int], int] = {}
+
+    def check_mode(st: os.stat_result) -> None:
+        if st.st_mode & (stat.S_ISUID | stat.S_ISGID):
+            raise Reject("set-ID bit in initial target")
+
+    def scan(directory_fd: int) -> None:
+        for name in os.listdir(directory_fd):
+            st = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            check_mode(st)
+            if stat.S_ISDIR(st.st_mode):
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    scan(child_fd)
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(st.st_mode):
+                key = (st.st_dev, st.st_ino)
+                counts[key] = counts.get(key, 0) + 1
+                previous = declared_links.setdefault(key, st.st_nlink)
+                if previous != st.st_nlink:
+                    raise Reject("initial hardlink graph changed during audit")
+            elif stat.S_ISLNK(st.st_mode):
+                if st.st_nlink != 1:
+                    raise Reject("hardlinked symlink in initial target")
+            else:
+                raise Reject("unsupported initial object type")
+
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        check_mode(os.fstat(root_fd))
+        scan(root_fd)
+    finally:
+        os.close(root_fd)
+    if any(counts[key] != declared_links[key] for key in counts):
+        raise Reject("initial regular inode has an alias outside target")
+
+
 def parent(root: Path, relative: str) -> tuple[Path, Path]:
     parts = relative.split("/")
     current = root
@@ -210,6 +255,7 @@ def apply(root_name: str, bundle_name: str) -> None:
     st = os.lstat(root)
     if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
         raise Reject("root is not a real directory")
+    audit_initial_tree(root)
     with open(bundle_name, "r", encoding="utf-8") as stream:
         doc = validate(json.load(stream))
     stage = Path(tempfile.mkdtemp(prefix=".rootfs-stage-", dir=str(root.parent)))

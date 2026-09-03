@@ -24,7 +24,7 @@ CANARY_TARGET = "__VERIFIER_OUTSIDE_CANARY__"
 GENERATOR_SEED = b"rootfs-delta-hardening/submission-cohort/v1"
 IMMUTABLE_INPUTS = {
     Path("/app/fixtures/bundle.json"): "144ebe90ebdbaa5fbe6bbd151c5fd72be37658d39399bd728b1c81ffe752b4d0",
-    Path("/app/SECURITY_SPEC.md"): "37c627c00a5291d9e56518f603b9f38ac4b4782d7631fa4f0a4bc51173a792b7",
+    Path("/app/SECURITY_SPEC.md"): "b91d3ef1fecabaf27b1f4e1a8a86c7e5b1984fa157485dadc608b7d2834669d3",
 }
 
 
@@ -445,6 +445,20 @@ def submission_parent_rejection_bundles() -> list[dict]:
     ]
 
 
+def submission_initial_graph_names() -> dict[str, str]:
+    """Return deterministic per-submission names for initial-object-graph attacks."""
+    nonce = f"{submission_rng('initial-graph-v1').getrandbits(64):016x}"
+    return {
+        "subject": f"seed/audit-subject-{nonce}",
+        "internal_alias": f"seed/audit-alias-{nonce}",
+        "directory": f"seed/audit-directory-{nonce}",
+        "fifo": f"seed/audit-pipe-{nonce}",
+        "symlink": f"seed/audit-symlink-{nonce}",
+        "moved_symlink": f"seed/audit-moved-symlink-{nonce}",
+        "probe": f"seed/audit-probe-{nonce}",
+    }
+
+
 def expected_for(bundle: dict, fallback_root: Path) -> dict[str, tuple]:
     initial_tree(fallback_root)
     model_apply(fallback_root, bundle["operations"])
@@ -501,6 +515,7 @@ def test_submission_derived_generators_are_reproducible():
     """Identical submitted bytes must always produce an identical graded cohort."""
     assert submission_generated_valid_bundles() == submission_generated_valid_bundles()
     assert submission_parent_rejection_bundles() == submission_parent_rejection_bundles()
+    assert submission_initial_graph_names() == submission_initial_graph_names()
 
 
 @pytest.mark.parametrize("fallback", [False, True])
@@ -594,6 +609,78 @@ def test_invalid_json_and_root_symlink_are_rejected():
             link_root.unlink(missing_ok=True)
     finally:
         bad.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("hazard", [
+    "external-hardlink-referenced",
+    "external-hardlink-unreferenced",
+    "external-symlink-hardlink",
+    "setuid-file",
+    "setgid-directory",
+    "setgid-root",
+    "fifo",
+])
+def test_unsafe_initial_object_graph_is_rejected_unchanged(hazard: str, fallback: bool):
+    """Initial external inode aliases, set-ID entries, and special objects must fail before mutation."""
+    copy_initial(TARGET)
+    canary = Path(tempfile.mkdtemp(prefix=".initial-graph-canary-", dir=TARGET.parent))
+    try:
+        populate_canary(canary)
+        names = submission_initial_graph_names()
+        operation_target = "seed/keep.txt"
+        if hazard in {"external-hardlink-referenced", "external-hardlink-unreferenced"}:
+            subject = TARGET / names["subject"]
+            subject.write_bytes(b"closed-graph-subject")
+            os.link(subject, TARGET / names["internal_alias"])
+            os.link(subject, canary / "external-alias")
+            if hazard == "external-hardlink-referenced":
+                operation_target = names["subject"]
+        elif hazard == "external-symlink-hardlink":
+            link = TARGET / names["symlink"]
+            link.symlink_to("keep.txt")
+            os.link(link, canary / "external-symlink-alias", follow_symlinks=False)
+        elif hazard == "setuid-file":
+            subject = TARGET / names["subject"]
+            subject.write_bytes(b"setuid-subject")
+            os.chmod(subject, 0o4755)
+        elif hazard == "setgid-directory":
+            directory = TARGET / names["directory"]
+            directory.mkdir()
+            os.chmod(directory, 0o2755)
+        elif hazard == "setgid-root":
+            os.chmod(TARGET, 0o2755)
+        elif hazard == "fifo":
+            os.mkfifo(TARGET / names["fifo"], 0o600)
+        else:
+            raise AssertionError(hazard)
+
+        before = tree_snapshot(TARGET)
+        outside_before = outside_snapshot(canary)
+        if hazard == "external-symlink-hardlink":
+            bundle = {"format": 1, "operations": [{
+                "op": "rename",
+                "src": names["symlink"],
+                "dst": names["moved_symlink"],
+                "uid": 1234,
+                "gid": 1235,
+                "mtime_ns": 1_700_040_000_000_000_000,
+            }]}
+        else:
+            bundle = {"format": 1, "operations": [{
+                "op": "hardlink",
+                "path": names["probe"],
+                "target": operation_target,
+                "mode": 0o600,
+                "mtime_ns": 1_700_040_000_000_000_000,
+                "xattrs": {"user.audit": enc(b"must-not-cross-root")},
+            }]}
+        result = run_bundle(bundle, fallback=fallback)
+        assert result.returncode != 0
+        assert tree_snapshot(TARGET) == before
+        assert outside_snapshot(canary) == outside_before
+    finally:
+        shutil.rmtree(canary, ignore_errors=True)
 
 
 @pytest.mark.parametrize("bundle", [
