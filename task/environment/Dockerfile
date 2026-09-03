@@ -5,5 +5,8 @@ RUN mkdir -p /app/src /app/fixtures /app/target
 COPY data/rootfs_apply.py /app/src/rootfs_apply.py
 COPY data/SECURITY_SPEC.md /app/SECURITY_SPEC.md
 COPY data/bundle.json /app/fixtures/bundle.json
-RUN chmod 0644 /app/src/rootfs_apply.py && chmod 0644 /app/SECURITY_SPEC.md /app/fixtures/bundle.json
+COPY data/runtime-entrypoint.sh /usr/local/bin/dynamo-runtime-entrypoint
+RUN chmod 0644 /app/src/rootfs_apply.py && chmod 0644 /app/SECURITY_SPEC.md /app/fixtures/bundle.json \
+    && chmod 0755 /usr/local/bin/dynamo-runtime-entrypoint
 WORKDIR /app
+ENTRYPOINT ["/usr/local/bin/dynamo-runtime-entrypoint"]

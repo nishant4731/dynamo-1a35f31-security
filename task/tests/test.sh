@@ -8,10 +8,15 @@
 # tests/ at /tests only at verify time, so keep ground truth / expected outputs in tests/
 # (never in environment/, where the agent could read them).
 # --ctrf writes a standard JSON report; write 1/0 to /logs/verifier/reward.txt.
-pytest --ctrf /logs/verifier/ctrf.json /tests/test_outputs.py -rA
+set +e
+/usr/local/bin/pytest --ctrf /logs/verifier/ctrf.json /tests/test_outputs.py -rA
+pytest_status=$?
+set -e
 
-if [ $? -eq 0 ]; then
+if [ "$pytest_status" -eq 0 ]; then
   echo 1 > /logs/verifier/reward.txt
 else
   echo 0 > /logs/verifier/reward.txt
 fi
+
+exit "$pytest_status"

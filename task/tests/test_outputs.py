@@ -3,28 +3,35 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import functools
 import hashlib
 import json
 import os
 import random
+import select
 import shutil
+import signal
 import stat
+import struct
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
 
 APP = Path("/app/src/rootfs_apply.py")
+PYTHON = "/usr/local/bin/python3"
 TARGET = Path("/app/target")
 CANARY_TARGET = "__VERIFIER_OUTSIDE_CANARY__"
 GENERATOR_SEED = b"rootfs-delta-hardening/submission-cohort/v1"
+FAULT_INJECTION_PATH = Path("/tests/fault_injection")
 IMMUTABLE_INPUTS = {
     Path("/app/fixtures/bundle.json"): "144ebe90ebdbaa5fbe6bbd151c5fd72be37658d39399bd728b1c81ffe752b4d0",
-    Path("/app/SECURITY_SPEC.md"): "b91d3ef1fecabaf27b1f4e1a8a86c7e5b1984fa157485dadc608b7d2834669d3",
+    Path("/app/SECURITY_SPEC.md"): "0a190cd6c32ad3f665d78d2e04ed7b0060502358f9cc7a822f6957826fa71362",
 }
 
 
@@ -164,13 +171,21 @@ def copy_initial(root: Path) -> None:
 def run_bundle(bundle: dict, *, fallback: bool = False, root: Path = TARGET, timeout: float = 8.0) -> subprocess.CompletedProcess[str]:
     bundle_path = Path(tempfile.mktemp(prefix="bundle-", suffix=".json", dir="/tmp"))
     bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
-    command = ["python3", str(APP), "--root", str(root), "--bundle", str(bundle_path)]
+    command = [PYTHON, str(APP), "--root", str(root), "--bundle", str(bundle_path)]
     if fallback:
         command.append("--force-fallback")
     try:
         return subprocess.run(command, text=True, capture_output=True, timeout=timeout)
     finally:
         bundle_path.unlink(missing_ok=True)
+
+
+def bundle_command(bundle: dict, *, fallback: bool, root: Path, bundle_path: Path) -> list[str]:
+    bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+    command = [PYTHON, str(APP), "--root", str(root), "--bundle", str(bundle_path)]
+    if fallback:
+        command.append("--force-fallback")
+    return command
 
 
 def model_apply(root: Path, operations: list[dict]) -> None:
@@ -459,6 +474,28 @@ def submission_initial_graph_names() -> dict[str, str]:
     }
 
 
+def publication_bundle() -> dict:
+    """Create a deterministic submitted-artifact-specific multi-entry generation."""
+    nonce = f"{submission_rng('publication-v1').getrandbits(64):016x}"
+    generation = f"generation-{nonce}"
+    operations = [{"op": "mkdir", "path": generation, "mode": 0o750}]
+    for index in range(12):
+        directory = f"{generation}/slot-{index:02d}-{nonce}"
+        operations.extend([
+            {"op": "mkdir", "path": directory, "mode": 0o750},
+            {
+                "op": "write",
+                "path": f"{directory}/value",
+                "data_b64": enc(f"generation-value-{index:02d}-{nonce}".encode()),
+                "mode": 0o640,
+                "mtime_ns": 1_700_050_000_000_000_000 + index,
+                "xattrs": {"user.generation": enc(nonce.encode())},
+            },
+        ])
+    operations.append({"op": "mkdir", "path": "seed", "mode": 0o755, "mtime_ns": 1_700_050_100_000_000_000})
+    return {"format": 1, "operations": operations}
+
+
 def expected_for(bundle: dict, fallback_root: Path) -> dict[str, tuple]:
     initial_tree(fallback_root)
     model_apply(fallback_root, bundle["operations"])
@@ -495,6 +532,79 @@ def comparable(actual: dict[str, tuple], expected: dict[str, tuple], bundle: dic
     return left, right
 
 
+def tree_matches(actual: dict[str, tuple], expected: dict[str, tuple], bundle: dict) -> bool:
+    left, right = comparable(actual, expected, bundle)
+    return left == right
+
+
+INOTIFY_EVENT = struct.Struct("iIII")
+IN_ATTRIB = 0x00000004
+IN_CLOSE_WRITE = 0x00000008
+IN_MOVED_FROM = 0x00000040
+IN_MOVED_TO = 0x00000080
+IN_CREATE = 0x00000100
+IN_DELETE = 0x00000200
+IN_DELETE_SELF = 0x00000400
+IN_MOVE_SELF = 0x00000800
+INOTIFY_MUTATION_MASK = (
+    IN_ATTRIB | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO |
+    IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF
+)
+
+
+def install_publication_watches(parent: Path, root: Path) -> tuple[int, dict[int, Path]]:
+    """Watch the root entry and its initial directories for the first live mutation."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    descriptor = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+    if descriptor < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    watches: dict[int, Path] = {}
+    try:
+        directories = [parent, root, *sorted(path for path in root.rglob("*") if path.is_dir() and not path.is_symlink())]
+        for path in directories:
+            watch = libc.inotify_add_watch(descriptor, os.fsencode(path), INOTIFY_MUTATION_MASK)
+            if watch < 0:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error))
+            watches[watch] = path
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor, watches
+
+
+def first_publication_event(
+    descriptor: int,
+    watches: dict[int, Path],
+    parent: Path,
+    root: Path,
+    timeout: float,
+) -> tuple[Path, str, int] | None:
+    """Return the first root-entry or in-root mutation event, ignoring private siblings."""
+    poller = select.poll()
+    poller.register(descriptor, select.POLLIN)
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not poller.poll(max(1, int(remaining * 1000))):
+            return None
+        payload = os.read(descriptor, 65536)
+        offset = 0
+        while offset < len(payload):
+            watch, mask, _cookie, length = INOTIFY_EVENT.unpack_from(payload, offset)
+            offset += INOTIFY_EVENT.size
+            raw_name = payload[offset:offset + length]
+            offset += length
+            name = raw_name.split(b"\0", 1)[0].decode("utf-8", errors="replace")
+            watched = watches.get(watch)
+            if watched == parent:
+                if name == root.name and mask & INOTIFY_MUTATION_MASK:
+                    return watched, name, mask
+            elif watched is not None and mask & INOTIFY_MUTATION_MASK:
+                return watched, name, mask
+
+
 def test_repaired_program_is_the_declared_artifact():
     """The agent must leave the repaired executable source at /app/src/rootfs_apply.py."""
     assert APP.is_file()
@@ -516,12 +626,14 @@ def test_submission_derived_generators_are_reproducible():
     assert submission_generated_valid_bundles() == submission_generated_valid_bundles()
     assert submission_parent_rejection_bundles() == submission_parent_rejection_bundles()
     assert submission_initial_graph_names() == submission_initial_graph_names()
+    assert publication_bundle() == publication_bundle()
 
 
 @pytest.mark.parametrize("fallback", [False, True])
 def test_valid_bundles_preserve_canonical_semantics(fallback: bool):
     """Valid bundles must reproduce complete tree, metadata, whiteout, opaque, and link semantics in both modes."""
-    for index, bundle in enumerate(valid_bundles() + generated_valid_bundles() + fresh_generated_valid_bundles() + submission_generated_valid_bundles()):
+    bundles = valid_bundles() + generated_valid_bundles() + fresh_generated_valid_bundles() + submission_generated_valid_bundles() + [publication_bundle()]
+    for index, bundle in enumerate(bundles):
         copy_initial(TARGET)
         with tempfile.TemporaryDirectory(prefix="expected-") as expected_dir:
             expected_root = Path(expected_dir) / "target"
@@ -595,7 +707,7 @@ def test_invalid_json_and_root_symlink_are_rejected():
     bad = Path(tempfile.mktemp(prefix="invalid-", suffix=".json", dir="/tmp"))
     bad.write_text("{not json", encoding="utf-8")
     try:
-        result = subprocess.run(["python3", str(APP), "--root", str(TARGET), "--bundle", str(bad)], text=True, capture_output=True, timeout=8)
+        result = subprocess.run([PYTHON, str(APP), "--root", str(TARGET), "--bundle", str(bad)], text=True, capture_output=True, timeout=8)
         assert result.returncode != 0
         assert tree_snapshot(TARGET) == original
         link_root = TARGET.with_name("target-link")
@@ -609,6 +721,28 @@ def test_invalid_json_and_root_symlink_are_rejected():
             link_root.unlink(missing_ok=True)
     finally:
         bad.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_symlinked_root_ancestor_is_rejected_unchanged(fallback: bool):
+    """Every component in the supplied root spelling is a no-follow directory boundary."""
+    with tempfile.TemporaryDirectory(prefix="root-ancestor-") as raw:
+        base = Path(raw)
+        real_parent = base / "real-parent"
+        real_parent.mkdir()
+        root = real_parent / "target"
+        initial_tree(root)
+        before = tree_snapshot(root)
+        alias_parent = base / "alias-parent"
+        alias_parent.symlink_to(real_parent, target_is_directory=True)
+        bundle = {"format": 1, "operations": [{
+            "op": "write",
+            "path": "seed/ancestor-probe",
+            "data_b64": enc(b"must-not-follow-root-ancestor"),
+        }]}
+        result = run_bundle(bundle, fallback=fallback, root=alias_parent / "target")
+        assert result.returncode != 0
+        assert tree_snapshot(root) == before
 
 
 @pytest.mark.parametrize("fallback", [False, True])
@@ -696,6 +830,76 @@ def test_malformed_bundles_reject_without_writes(bundle: dict):
     result = run_bundle(bundle)
     assert result.returncode != 0
     assert tree_snapshot(TARGET) == before
+
+
+def publication_crash_case(*, fallback: bool, mode: str, iteration: int) -> tuple[bool, dict]:
+    """Cut one publication attempt and report whether the target is an exact generation."""
+    bundle = publication_bundle()
+    with tempfile.TemporaryDirectory(prefix="publication-parent-") as raw_parent:
+        parent = Path(raw_parent)
+        root = parent / "target"
+        initial_tree(root)
+        old = tree_snapshot(root)
+        expected_root = parent / "expected"
+        new = expected_for(bundle, expected_root)
+        canary = Path(tempfile.mkdtemp(prefix="publication-canary-"))
+        populate_canary(canary)
+        outside_before = outside_snapshot(canary)
+        bundle_path = parent / "bundle.json"
+        command = bundle_command(bundle, fallback=fallback, root=root, bundle_path=bundle_path)
+        event = None
+        try:
+            if mode == "post-rename":
+                environment = dict(os.environ)
+                existing_pythonpath = environment.get("PYTHONPATH")
+                environment["PYTHONPATH"] = str(FAULT_INJECTION_PATH) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+                environment["ROOTFS_PUBLISH_FAULT"] = "post-rename"
+                result = subprocess.run(command, text=True, capture_output=True, timeout=8.0, env=environment)
+                returncode = result.returncode
+            elif mode == "live-event":
+                descriptor, watches = install_publication_watches(parent, root)
+                try:
+                    process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    event = first_publication_event(descriptor, watches, parent, root, timeout=8.0)
+                    if event is not None and process.poll() is None:
+                        os.kill(process.pid, signal.SIGKILL)
+                    try:
+                        process.communicate(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate()
+                    returncode = process.returncode
+                finally:
+                    os.close(descriptor)
+            else:
+                raise AssertionError(mode)
+
+            actual = tree_snapshot(root)
+            exact_old = tree_matches(actual, old, bundle)
+            exact_new = tree_matches(actual, new, bundle)
+            outside_unchanged = outside_snapshot(canary) == outside_before
+            details = {
+                "mode": mode,
+                "iteration": iteration,
+                "returncode": returncode,
+                "event": None if event is None else (str(event[0]), event[1], event[2]),
+                "exact_old": exact_old,
+                "exact_new": exact_new,
+                "outside_unchanged": outside_unchanged,
+                "actual_names": sorted(actual),
+            }
+            return (exact_old or exact_new) and outside_unchanged, details
+        finally:
+            shutil.rmtree(canary, ignore_errors=True)
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_publication_crash_cuts_are_always_exact_old_or_new(fallback: bool):
+    """One rename cut plus four live-mutation cuts may never expose an absent or mixed target."""
+    outcomes = [publication_crash_case(fallback=fallback, mode="post-rename", iteration=0)]
+    outcomes.extend(publication_crash_case(fallback=fallback, mode="live-event", iteration=index) for index in range(4))
+    violations = [details for valid, details in outcomes if not valid]
+    assert not violations, violations
 
 
 def test_path_swap_race_has_zero_canary_violations_across_64_runs():

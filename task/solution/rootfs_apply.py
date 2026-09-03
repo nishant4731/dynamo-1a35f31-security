@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import ctypes
 import json
 import os
 import shutil
@@ -19,6 +20,7 @@ class Reject(Exception):
 
 
 OPS = {"mkdir", "write", "symlink", "hardlink", "rename", "unlink", "whiteout", "opaque"}
+RENAME_EXCHANGE = 2
 
 
 def canon(value: object) -> str:
@@ -82,7 +84,27 @@ def validate(doc: object) -> dict:
     return doc
 
 
-def audit_initial_tree(root: Path) -> None:
+def open_root_nofollow(root_name: str) -> tuple[str, int, int, str]:
+    """Open every component of an absolute root spelling without following links."""
+    root = os.path.abspath(root_name)
+    parts = [part for part in root.split("/") if part]
+    if not parts:
+        raise Reject("the filesystem root cannot be replaced atomically")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    current_fd = os.open("/", flags)
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(part, flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        root_fd = os.open(parts[-1], flags, dir_fd=current_fd)
+    except Exception:
+        os.close(current_fd)
+        raise
+    return root, current_fd, root_fd, parts[-1]
+
+
+def audit_initial_tree(root_fd: int) -> None:
     """Reject privilege-bearing objects and regular inodes linked outside root."""
     counts: dict[tuple[int, int], int] = {}
     declared_links: dict[tuple[int, int], int] = {}
@@ -117,12 +139,8 @@ def audit_initial_tree(root: Path) -> None:
             else:
                 raise Reject("unsupported initial object type")
 
-    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    try:
-        check_mode(os.fstat(root_fd))
-        scan(root_fd)
-    finally:
-        os.close(root_fd)
+    check_mode(os.fstat(root_fd))
+    scan(root_fd)
     if any(counts[key] != declared_links[key] for key in counts):
         raise Reject("initial regular inode has an alias outside target")
 
@@ -171,7 +189,20 @@ def copy_tree_preserving_links(source: Path, destination: Path) -> None:
             copied[key] = dst_path
         return result
 
-    shutil.copytree(source, destination, symlinks=True, copy_function=copy_file)
+    shutil.copytree(source, destination, symlinks=True, copy_function=copy_file, dirs_exist_ok=True)
+
+
+def rename_exchange(parent_fd: int, left: str, right: str) -> None:
+    """Atomically exchange two same-parent directory entries."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = getattr(libc, "renameat2", None)
+    if function is None:
+        raise Reject("renameat2 is unavailable")
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    if function(parent_fd, os.fsencode(left), parent_fd, os.fsencode(right), RENAME_EXCHANGE) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
 
 
 def apply_meta(path: Path, op: dict) -> None:
@@ -251,32 +282,36 @@ def apply_op(root: Path, op: dict) -> None:
 
 
 def apply(root_name: str, bundle_name: str) -> None:
-    root = Path(root_name).absolute()
-    st = os.lstat(root)
-    if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
-        raise Reject("root is not a real directory")
-    audit_initial_tree(root)
-    with open(bundle_name, "r", encoding="utf-8") as stream:
-        doc = validate(json.load(stream))
-    stage = Path(tempfile.mkdtemp(prefix=".rootfs-stage-", dir=str(root.parent)))
-    shutil.rmtree(stage)
-    backup = root.parent / (".rootfs-old-" + next(tempfile._get_candidate_names()))
+    root_name, parent_fd, root_fd, root_leaf = open_root_nofollow(root_name)
+    root = Path(root_name)
+    exchanged = False
+    stage: Path | None = None
     try:
+        audit_initial_tree(root_fd)
+        with open(bundle_name, "r", encoding="utf-8") as stream:
+            doc = validate(json.load(stream))
+        parent_path = f"/proc/self/fd/{parent_fd}"
+        stage = Path(tempfile.mkdtemp(prefix=".rootfs-stage-", dir=parent_path))
         copy_tree_preserving_links(root, stage)
+        root_st = os.fstat(root_fd)
+        os.chown(stage, root_st.st_uid, root_st.st_gid, follow_symlinks=False)
         for op in doc["operations"]:
             apply_op(stage, op)
-        os.rename(root, backup)
+
+        current = os.stat(root_leaf, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (root_st.st_dev, root_st.st_ino):
+            raise Reject("root entry changed before publication")
+        rename_exchange(parent_fd, root_leaf, stage.name)
+        exchanged = True
         try:
-            os.rename(stage, root)
-        except Exception:
-            os.rename(backup, root)
-            raise
-        shutil.rmtree(backup)
+            shutil.rmtree(stage)
+        except OSError:
+            pass
     finally:
-        if os.path.lexists(stage):
+        if not exchanged and stage is not None and os.path.lexists(stage):
             shutil.rmtree(stage, ignore_errors=True)
-        if os.path.lexists(backup):
-            shutil.rmtree(backup, ignore_errors=True)
+        os.close(root_fd)
+        os.close(parent_fd)
 
 
 def main(argv: list[str] | None = None) -> int:
