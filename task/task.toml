@@ -1,38 +1,32 @@
-artifacts = []  # paths the verifier reads from the agent (e.g. ["/app/output.json"]) — must be above the first [section]
+artifacts = ["/app/src/rootfs_apply.py"]
 
 [task]
-name = "dynamo/your-task-name"  # required format: org/name (Harbor needs the slash); name part lowercase kebab-case, <=3 words
-description = ""                 # one-line summary of the task
+name = "dynamo/rootfs-delta-hardening"
+description = "Harden a privileged rootfs delta applier against traversal, link, metadata, and race attacks."
 
 [metadata]
-# --- Pre-seeded for you when this repo was created — DO NOT EDIT ---
-category = "Security"                      # diversity category, assigned to your task by the Dynamo team
-subcategory = "Security hardening"                   # diversity subcategory, assigned by the Dynamo team
-# --- Fixed for this dataset — LEAVE AS-IS ---
-model_tested = "Opus-4.8"           # difficulty-benchmarking model (do not change)
-agent_tested = "Terminus-2"        # difficulty-benchmarking agent (do not change)
-# --- You fill these in ---
-# task_objective / artifact_type: pick from .dynamo/diversity-taxonomy.toml (lowercase snake_case).
-task_objective = []                # e.g. ["implement", "debug"]
-artifact_type = []                 # e.g. ["codebase", "configuration_file"]
-expert_time_estimate_hours = 0     # best-case hours for a focused domain expert with the intended insight
-difficulty_explanation = ""        # why this task is hard for agents and humans
-solution_explanation = ""          # high-level approach and key insights
-verification_explanation = ""      # how the tests verify correctness
+category = "Security"
+subcategory = "Security hardening"
+model_tested = "GPT-5.4"
+agent_tested = "Terminus-2"
+task_objective = ["secure_or_harden", "fix"]
+artifact_type = ["codebase", "security_artifact"]
+expert_time_estimate_hours = 24
+difficulty_explanation = "This is work for a Linux product-security engineer or OCI/update-system author hardening a privileged container-layer or OTA rootfs applier. It involves descriptor-relative root and operation-path resolution, TOCTOU resistance, ordered stateful layer semantics, a closed initial hardlink graph, alias-visible metadata, fresh-inode replacement, exact metadata effects, rollback, crash-atomic publication, and adversarial concurrency. A lexical sanitizer, one realpath check, or ordinary two-rename rollback is insufficient: root ancestors may be symlinks, in-root inodes may alias outside names, and abrupt death between publication syscalls can expose an absent or mixed root. The starter and verifier-generated bundles are synthetic, but model realistic container/OTA updater trees, crash cuts, and attack patterns; unseen fixtures combine the rules in ways that defeat single-case patches."
+solution_explanation = "The solver must derive and enforce a confinement invariant for the root spelling and every operation, audit the untrusted initial object graph, preserve the ordered bundle state machine, and separate safe staging from one-step publication. A viable solution walks the absolute root from `/` with no-follow directory descriptors (including under `--force-fallback`), reconciles each regular inode's observed in-root aliases with st_nlink, rejects hardlinked symlinks plus special or set-ID initial entries, applies links and whiteouts in a private same-parent stage, produces the exact final ownership/mode/xattr/mtime state, verifies the live root identity, and atomically publishes with `renameat2(RENAME_EXCHANGE)`. The retired generation can then be cleaned best-effort without creating a partial-root crash window."
+verification_explanation = "The verifier first integrity-pins the immutable public bundle and semantics document through no-follow regular-file descriptors. It then runs the submitted program on independently modeled valid bundles, deterministic multi-seed bundles, and deterministic submission-namespaced bundles whose expected outcomes are computed by the same independent model. A fixed domain-separated seed plus the no-follow digest of the submitted artifact makes identical submissions receive identical cohorts while varying namespaces across distinct submissions. The verifier compares the complete resulting tree, file bytes, object types, hardlink inode relationships, full special/permission modes (with only permission and sticky bits valid), uid/gid, exact user.* xattr maps, and mtime_ns for unchanged fixed-time initial paths or operation output paths with explicit mtime_ns; creation-time mtimes without an explicit value, atime, ctime, and otherwise unobservable metadata-call ordering are not graded. It checks terminal-symlink replacement plus non-zero unchanged-state rejection for malformed inputs, object-type collisions, missing/non-directory parents, symlinked root ancestors, transactionally late failures, initial set-ID/special objects, externally aliased regular inodes, and hardlinked initial symlinks, as well as every operation role through canary-targeted symlink parents in normal and forced-fallback modes. Initial-graph attacks require exact inside/outside snapshots. A deterministic 64-run component-swap race permits zero canary violations. Ten deterministic publication crash cuts (five per CLI mode) accept only an exact old or complete new target and permit zero absent/mixed states. Generated values change only valid names and metadata, never the acceptance rule."
 
 [verifier]
-timeout_sec = 120.0                # increase based on your test suite's runtime demands
-# Canonical TB2: the verifier runs in the environment image (no separate tests/Dockerfile).
-# Harbor overlays tests/ at verify time; leave environment_mode unset for this shared model.
+timeout_sec = 180.0
 
 [agent]
-timeout_sec = 120.0                # raise for hard tasks — agents may run for many minutes or hours
+timeout_sec = 3600.0
 
 [environment]
-build_timeout_sec = 600.0          # max seconds for the Docker build
-cpus = 1                           # increase for parallel/compute-heavy workloads
-memory_mb = 2048                   # increase for large datasets or in-memory processing
-storage_mb = 10240                 # increase for tasks with large files or build artifacts
-gpus = 0                           # max 1, expect H100
-allow_internet = true              # open internet is available to the agent
-mcp_servers = []                   # optional MCP servers to expose to the agent
+build_timeout_sec = 600.0
+cpus = 2
+memory_mb = 2048
+storage_mb = 10240
+gpus = 0
+allow_internet = true
+mcp_servers = []
