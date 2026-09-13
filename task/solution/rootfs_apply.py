@@ -348,7 +348,7 @@ def apply(root_name: str, bundle_name: str) -> None:
             doc = validate(json.load(stream))
         parent_path = f"/proc/self/fd/{parent_fd}"
         stage = Path(tempfile.mkdtemp(prefix=".rootfs-stage-", dir=parent_path))
-        for attempt in range(1024):
+        for attempt in range(4096):
             try:
                 copy_tree_preserving_links_fd(root_fd, stage)
                 break

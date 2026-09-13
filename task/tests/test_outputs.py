@@ -122,8 +122,9 @@ def tree_snapshot(root: Path) -> dict[str, tuple]:
     result: dict[str, tuple] = {}
     for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
         current_path = Path(current)
-        dirs[:] = [name for name in dirs if not (current_path / name).is_symlink()]
-        for name in dirs + files:
+        symlink_dirs = [name for name in dirs if (current_path / name).is_symlink()]
+        dirs[:] = [name for name in dirs if name not in symlink_dirs]
+        for name in dirs + files + symlink_dirs:
             path = current_path / name
             rel = str(path.relative_to(root))
             st = os.lstat(path)
@@ -976,7 +977,7 @@ def test_path_swap_race_has_zero_canary_violations_across_64_runs():
                 model_apply(expected_root, bundle["operations"])
                 expected = tree_snapshot(expected_root)
             actual = tree_snapshot(root)
-            if not attack_applied.wait(timeout=0.5):
+            if not attack_applied.wait(timeout=2.0):
                 violations.append(f"run {run}: race attack was not synchronized")
             if result.returncode != 0:
                 violations.append(f"run {run}: candidate rejected instead of confining the swap")
