@@ -27,4 +27,4 @@ Publication must survive abrupt death, not merely exceptions. Fully metadata-fin
 
 Treat `/app/fixtures/bundle.json` and `/app/target` as untrusted. Rejection is non-zero with unchanged target; stderr is ungraded. Success must not modify outside paths, follow attacker-created links, or expose partial failure. Preserve whiteout-over-directory, opaque, sticky-directory, hardlink, and metadata semantics.
 
-Do not modify `/app/fixtures/bundle.json` or `/app/SECURITY_SPEC.md`. Deliver only repaired `/app/src/rootfs_apply.py`; generated bundles vary names, order, metadata, and attacks.
+Do not modify `/app/fixtures/bundle.json` or `/app/SECURITY_SPEC.md`. Deliver only repaired `/app/src/rootfs_apply.py`; generated bundles vary names, order, metadata, and attacks. Normative mechanism detail lives in `SECURITY_SPEC.md`.

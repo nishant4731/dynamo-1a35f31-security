@@ -981,26 +981,12 @@ def test_path_swap_race_has_zero_canary_violations_across_64_runs():
                             pass
                     time.sleep(0.001)
 
-            result_holder: dict[str, subprocess.CompletedProcess[str]] = {}
-
-            def run_candidate() -> None:
-                result_holder["result"] = run_bundle(bundle, fallback=(run % 2 == 1), root=root, timeout=8.0)
-
             thread = threading.Thread(target=mutate, daemon=True)
-            candidate = threading.Thread(target=run_candidate, daemon=True)
             thread.start()
             candidate_go.write_text("1", encoding="ascii")
-            candidate.start()
-            while candidate.is_alive():
-                candidate_go.touch()
-                time.sleep(0.001)
-            candidate.join(timeout=9.0)
+            result = run_bundle(bundle, fallback=(run % 2 == 1), root=root, timeout=8.0)
             stop.set()
             thread.join(timeout=1.0)
-            result = result_holder.get("result")
-            if result is None:
-                violations.append(f"run {run}: candidate did not finish")
-                continue
             with tempfile.TemporaryDirectory(prefix="race-expected-") as expected_dir:
                 expected_root = Path(expected_dir) / "target"
                 expected_root.mkdir()
@@ -1009,7 +995,7 @@ def test_path_swap_race_has_zero_canary_violations_across_64_runs():
                 model_apply(expected_root, bundle["operations"])
                 expected = tree_snapshot(expected_root)
             actual = tree_snapshot(root)
-            if not attack_applied.wait(timeout=2.0):
+            if not attack_applied.wait(timeout=1.0):
                 violations.append(f"run {run}: race attack was not synchronized")
             if result.returncode != 0:
                 violations.append(f"run {run}: candidate rejected instead of confining the swap")
