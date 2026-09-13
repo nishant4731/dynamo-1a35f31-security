@@ -469,6 +469,9 @@ def submission_initial_graph_names() -> dict[str, str]:
         "internal_alias": f"seed/audit-alias-{nonce}",
         "directory": f"seed/audit-directory-{nonce}",
         "fifo": f"seed/audit-pipe-{nonce}",
+        "block": f"seed/audit-block-{nonce}",
+        "char": f"seed/audit-char-{nonce}",
+        "socket": f"seed/audit-socket-{nonce}",
         "symlink": f"seed/audit-symlink-{nonce}",
         "moved_symlink": f"seed/audit-moved-symlink-{nonce}",
         "probe": f"seed/audit-probe-{nonce}",
@@ -755,6 +758,9 @@ def test_symlinked_root_ancestor_is_rejected_unchanged(fallback: bool):
     "setgid-directory",
     "setgid-root",
     "fifo",
+    "block-device",
+    "char-device",
+    "socket",
 ])
 def test_unsafe_initial_object_graph_is_rejected_unchanged(hazard: str, fallback: bool):
     """Initial external inode aliases, set-ID entries, and special objects must fail before mutation."""
@@ -787,6 +793,18 @@ def test_unsafe_initial_object_graph_is_rejected_unchanged(hazard: str, fallback
             os.chmod(TARGET, 0o2755)
         elif hazard == "fifo":
             os.mkfifo(TARGET / names["fifo"], 0o600)
+        elif hazard == "block-device":
+            os.mknod(TARGET / names["block"], stat.S_IFBLK | 0o600, os.makedev(8, 1))
+        elif hazard == "char-device":
+            os.mknod(TARGET / names["char"], stat.S_IFCHR | 0o600, os.makedev(1, 3))
+        elif hazard == "socket":
+            import socket as socket_module
+            socket_path = TARGET / names["socket"]
+            server = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
+            try:
+                server.bind(os.fsencode(socket_path))
+            finally:
+                server.close()
         else:
             raise AssertionError(hazard)
 
