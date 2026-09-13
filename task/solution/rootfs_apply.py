@@ -175,13 +175,19 @@ def remove_tree(path: Path, missing_ok: bool = False) -> None:
 
 def copy_regular_file(src_fd: int, name: str, destination: Path, copied: dict[tuple[int, int], Path]) -> None:
     """Copy one regular file through an already-open directory descriptor."""
-    st = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
+    try:
+        st = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise Reject("path component swap detected during staging") from exc
     key = (st.st_dev, st.st_ino)
     if key in copied:
         os.link(copied[key], destination)
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
-    source_file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=src_fd)
+    try:
+        source_file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=src_fd)
+    except OSError as exc:
+        raise Reject("path component swap detected during staging") from exc
     try:
         with os.fdopen(source_file_fd, "rb", closefd=False) as source_stream, open(destination, "wb") as stream:
             shutil.copyfileobj(source_stream, stream)
@@ -202,6 +208,65 @@ def copy_regular_file(src_fd: int, name: str, destination: Path, copied: dict[tu
     os.chown(destination, st.st_uid, st.st_gid, follow_symlinks=False)
     os.utime(destination, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
     copied[key] = destination
+
+
+def source_has_directory(root_fd: int, relative: str) -> bool:
+    """Return whether a relative path is a real directory in the live root."""
+    if not relative:
+        return True
+    parts = relative.split("/")
+    current_fd = root_fd
+    opened: list[int] = []
+    try:
+        for index, part in enumerate(parts):
+            try:
+                entry_st = os.stat(part, dir_fd=current_fd, follow_symlinks=False)
+            except OSError:
+                return False
+            if index == len(parts) - 1:
+                return stat.S_ISDIR(entry_st.st_mode) and not stat.S_ISLNK(entry_st.st_mode)
+            if stat.S_ISLNK(entry_st.st_mode) or not stat.S_ISDIR(entry_st.st_mode):
+                return False
+            child_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=current_fd,
+            )
+            if current_fd != root_fd:
+                opened.append(current_fd)
+            current_fd = child_fd
+        return True
+    finally:
+        for fd in opened:
+            os.close(fd)
+        if current_fd != root_fd:
+            os.close(current_fd)
+
+
+def stage_lost_required_directory(stage: Path, root_fd: int, required_dirs: set[str]) -> bool:
+    """True when staging dropped a directory that still exists in the live root."""
+    for prefix in required_dirs:
+        if prefix == "pivot" or not source_has_directory(root_fd, prefix):
+            continue
+        path = stage / prefix
+        try:
+            entry_st = os.lstat(path)
+        except FileNotFoundError:
+            return True
+        if stat.S_ISLNK(entry_st.st_mode) or not stat.S_ISDIR(entry_st.st_mode):
+            return True
+    return False
+
+
+def staging_should_retry(exc: Reject, stage: Path, root_fd: int, required_dirs: set[str]) -> bool:
+    message = str(exc)
+    if "path component swap detected during staging" in message:
+        return True
+    if message == "root entry changed before publication":
+        return True
+    if message in {"missing parent", "symlink or non-directory parent"}:
+        return stage_lost_required_directory(stage, root_fd, required_dirs)
+    return False
 
 
 def required_directory_prefixes(doc: dict) -> set[str]:
@@ -240,7 +305,10 @@ def copy_tree_preserving_links_fd(
     def copy_directory(src_fd: int, dst_dir: Path, rel: str) -> None:
         for name in os.listdir(src_fd):
             child_rel = f"{rel}/{name}" if rel else name
-            entry_st = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
+            try:
+                entry_st = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise Reject("path component swap detected during staging") from exc
             dst_path = dst_dir / name
             if stat.S_ISDIR(entry_st.st_mode) and not stat.S_ISLNK(entry_st.st_mode):
                 dst_path.mkdir(exist_ok=True)
@@ -376,32 +444,46 @@ def apply(root_name: str, bundle_name: str) -> None:
         required_dirs = required_directory_prefixes(doc)
         parent_path = f"/proc/self/fd/{parent_fd}"
         stage = Path(tempfile.mkdtemp(prefix=".rootfs-stage-", dir=parent_path))
-        staging_attempts = 4096
-        for attempt in range(staging_attempts):
+        while True:
+            for prefix in sorted(required_dirs):
+                if prefix == "pivot":
+                    continue
+                wait_until = time.monotonic() + 0.05
+                while not source_has_directory(root_fd, prefix):
+                    if time.monotonic() >= wait_until:
+                        break
+                    time.sleep(0.00005)
             try:
                 copy_tree_preserving_links_fd(root_fd, stage, required_dirs)
+                if stage_lost_required_directory(stage, root_fd, required_dirs):
+                    raise Reject("path component swap detected during staging")
+                root_st = os.fstat(root_fd)
+                os.chown(stage, root_st.st_uid, root_st.st_gid, follow_symlinks=False)
+                for op in doc["operations"]:
+                    apply_op(stage, op)
+                root_st = os.fstat(root_fd)
+                current = os.stat(root_leaf, dir_fd=parent_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (root_st.st_dev, root_st.st_ino):
+                    raise Reject("root entry changed before publication")
+                try:
+                    rename_exchange(parent_fd, root_leaf, stage.name)
+                except OSError as exc:
+                    raise Reject("path component swap detected during staging") from exc
+                exchanged = True
+                try:
+                    shutil.rmtree(stage)
+                except OSError:
+                    pass
                 break
             except Reject as exc:
-                if "path component swap detected during staging" not in str(exc) or attempt == staging_attempts - 1:
+                if not staging_should_retry(exc, stage, root_fd, required_dirs):
                     raise
-                shutil.rmtree(stage)
-                stage = Path(tempfile.mkdtemp(prefix=".rootfs-stage-", dir=parent_path))
-                time.sleep(0.0001)
-        root_st = os.fstat(root_fd)
-        os.chown(stage, root_st.st_uid, root_st.st_gid, follow_symlinks=False)
-        for op in doc["operations"]:
-            apply_op(stage, op)
-
-        root_st = os.fstat(root_fd)
-        current = os.stat(root_leaf, dir_fd=parent_fd, follow_symlinks=False)
-        if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (root_st.st_dev, root_st.st_ino):
-            raise Reject("root entry changed before publication")
-        rename_exchange(parent_fd, root_leaf, stage.name)
-        exchanged = True
-        try:
+            except OSError as exc:
+                swap = Reject("path component swap detected during staging")
+                if not staging_should_retry(swap, stage, root_fd, required_dirs):
+                    raise swap from exc
             shutil.rmtree(stage)
-        except OSError:
-            pass
+            stage = Path(tempfile.mkdtemp(prefix=".rootfs-stage-", dir=parent_path))
     finally:
         if not exchanged and stage is not None and os.path.lexists(stage):
             shutil.rmtree(stage, ignore_errors=True)

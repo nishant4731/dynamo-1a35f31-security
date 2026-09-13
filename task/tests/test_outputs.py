@@ -979,12 +979,12 @@ def test_path_swap_race_has_zero_canary_violations_across_64_runs():
                                 attack_applied.set()
                         except (FileNotFoundError, NotADirectoryError, OSError):
                             pass
-                    time.sleep(0.001)
+                    time.sleep(0.0001)
 
             thread = threading.Thread(target=mutate, daemon=True)
             thread.start()
             candidate_go.write_text("1", encoding="ascii")
-            result = run_bundle(bundle, fallback=(run % 2 == 1), root=root, timeout=15.0)
+            result = run_bundle(bundle, fallback=(run % 2 == 1), root=root, timeout=12.0)
             stop.set()
             thread.join(timeout=1.0)
             with tempfile.TemporaryDirectory(prefix="race-expected-") as expected_dir:
@@ -998,7 +998,8 @@ def test_path_swap_race_has_zero_canary_violations_across_64_runs():
             if not attack_applied.wait(timeout=2.0):
                 violations.append(f"run {run}: race attack was not synchronized")
             if result.returncode != 0:
-                violations.append(f"run {run}: candidate rejected instead of confining the swap")
+                detail = result.stderr.strip() or f"exit {result.returncode}"
+                violations.append(f"run {run}: candidate rejected ({detail}) instead of confining the swap")
             if not tree_matches(actual, expected, bundle):
                 violations.append(f"run {run}: target tree diverged from the modeled outcome")
             if marker.read_bytes() != f"marker-{run}".encode() or len(list(canary.iterdir())) != 1:
