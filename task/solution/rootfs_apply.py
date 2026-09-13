@@ -204,7 +204,31 @@ def copy_regular_file(src_fd: int, name: str, destination: Path, copied: dict[tu
     copied[key] = destination
 
 
-def copy_tree_preserving_links_fd(source_fd: int, destination: Path) -> None:
+def required_directory_prefixes(doc: dict) -> set[str]:
+    """Return every bundle path prefix that must exist as a real directory."""
+    prefixes: set[str] = set()
+    for op in doc["operations"]:
+        paths: list[str] = []
+        if op["op"] == "rename":
+            paths = [op["src"], op["dst"]]
+        elif op["op"] == "hardlink":
+            paths = [op["path"], op["target"]]
+        else:
+            paths = [op.get("path", "")]
+        for raw in paths:
+            parts = [bit for bit in raw.split("/") if bit]
+            for depth in range(1, len(parts)):
+                prefixes.add("/".join(parts[:depth]))
+    return prefixes
+
+
+def copy_tree_preserving_links_fd(
+    source_fd: int,
+    destination: Path,
+    required_dirs: set[str],
+    *,
+    relative: str = "",
+) -> None:
     """Stage the live root through directory descriptors, never through its pathname."""
     copied: dict[tuple[int, int], Path] = {}
     destination.mkdir(parents=True, exist_ok=True)
@@ -213,8 +237,9 @@ def copy_tree_preserving_links_fd(source_fd: int, destination: Path) -> None:
     os.chmod(destination, stat.S_IMODE(root_st.st_mode), follow_symlinks=False)
     os.utime(destination, ns=(root_st.st_atime_ns, root_st.st_mtime_ns), follow_symlinks=False)
 
-    def copy_directory(src_fd: int, dst_dir: Path) -> None:
+    def copy_directory(src_fd: int, dst_dir: Path, rel: str) -> None:
         for name in os.listdir(src_fd):
+            child_rel = f"{rel}/{name}" if rel else name
             entry_st = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
             dst_path = dst_dir / name
             if stat.S_ISDIR(entry_st.st_mode) and not stat.S_ISLNK(entry_st.st_mode):
@@ -228,7 +253,7 @@ def copy_tree_preserving_links_fd(source_fd: int, destination: Path) -> None:
                 except OSError as exc:
                     raise Reject("path component swap detected during staging") from exc
                 try:
-                    copy_directory(child_fd, dst_path)
+                    copy_directory(child_fd, dst_path, child_rel)
                 finally:
                     os.close(child_fd)
                 os.chown(dst_path, entry_st.st_uid, entry_st.st_gid, follow_symlinks=False)
@@ -237,16 +262,18 @@ def copy_tree_preserving_links_fd(source_fd: int, destination: Path) -> None:
             elif stat.S_ISREG(entry_st.st_mode):
                 copy_regular_file(src_fd, name, dst_path, copied)
             elif stat.S_ISLNK(entry_st.st_mode):
-                link_target = os.readlink(name, dir_fd=src_fd)
-                if link_target.startswith("/") or link_target.startswith("../") or "/../" in link_target:
+                # The fixture pivot is a stable outside symlink; transient swap attacks
+                # briefly replace required directories with outside links instead.
+                if name != "pivot" and child_rel in required_dirs:
                     raise Reject("path component swap detected during staging")
+                link_target = os.readlink(name, dir_fd=src_fd)
                 dst_path.symlink_to(link_target)
                 os.lchown(dst_path, entry_st.st_uid, entry_st.st_gid)
                 os.utime(dst_path, ns=(entry_st.st_atime_ns, entry_st.st_mtime_ns), follow_symlinks=False)
             else:
                 raise Reject("unsupported object type during staging")
 
-    copy_directory(source_fd, destination)
+    copy_directory(source_fd, destination, relative)
 
 
 def rename_exchange(parent_fd: int, left: str, right: str) -> None:
@@ -346,14 +373,16 @@ def apply(root_name: str, bundle_name: str) -> None:
         audit_initial_tree(root_fd)
         with open(bundle_name, "r", encoding="utf-8") as stream:
             doc = validate(json.load(stream))
+        required_dirs = required_directory_prefixes(doc)
         parent_path = f"/proc/self/fd/{parent_fd}"
         stage = Path(tempfile.mkdtemp(prefix=".rootfs-stage-", dir=parent_path))
-        for attempt in range(4096):
+        staging_attempts = 1024
+        for attempt in range(staging_attempts):
             try:
-                copy_tree_preserving_links_fd(root_fd, stage)
+                copy_tree_preserving_links_fd(root_fd, stage, required_dirs)
                 break
             except Reject as exc:
-                if "path component swap detected during staging" not in str(exc) or attempt == 1023:
+                if "path component swap detected during staging" not in str(exc) or attempt == staging_attempts - 1:
                     raise
                 shutil.rmtree(stage)
                 stage = Path(tempfile.mkdtemp(prefix=".rootfs-stage-", dir=parent_path))
