@@ -12,6 +12,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -172,24 +173,80 @@ def remove_tree(path: Path, missing_ok: bool = False) -> None:
         path.unlink()
 
 
-def copy_tree_preserving_links(source: Path, destination: Path) -> None:
-    """Stage the root without silently splitting pre-existing regular-file links."""
+def copy_regular_file(src_fd: int, name: str, destination: Path, copied: dict[tuple[int, int], Path]) -> None:
+    """Copy one regular file through an already-open directory descriptor."""
+    st = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
+    key = (st.st_dev, st.st_ino)
+    if key in copied:
+        os.link(copied[key], destination)
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source_file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=src_fd)
+    try:
+        with os.fdopen(source_file_fd, "rb", closefd=False) as source_stream, open(destination, "wb") as stream:
+            shutil.copyfileobj(source_stream, stream)
+        proc_path = f"/proc/self/fd/{source_file_fd}"
+        try:
+            for xattr_name in os.listxattr(proc_path, follow_symlinks=False):
+                os.setxattr(
+                    destination,
+                    xattr_name,
+                    os.getxattr(proc_path, xattr_name, follow_symlinks=False),
+                    follow_symlinks=False,
+                )
+        except OSError:
+            pass
+    finally:
+        os.close(source_file_fd)
+    os.chmod(destination, stat.S_IMODE(st.st_mode), follow_symlinks=False)
+    os.chown(destination, st.st_uid, st.st_gid, follow_symlinks=False)
+    os.utime(destination, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
+    copied[key] = destination
+
+
+def copy_tree_preserving_links_fd(source_fd: int, destination: Path) -> None:
+    """Stage the live root through directory descriptors, never through its pathname."""
     copied: dict[tuple[int, int], Path] = {}
+    destination.mkdir(parents=True, exist_ok=True)
+    root_st = os.fstat(source_fd)
+    os.chown(destination, root_st.st_uid, root_st.st_gid, follow_symlinks=False)
+    os.chmod(destination, stat.S_IMODE(root_st.st_mode), follow_symlinks=False)
+    os.utime(destination, ns=(root_st.st_atime_ns, root_st.st_mtime_ns), follow_symlinks=False)
 
-    def copy_file(src: str, dst: str) -> str:
-        src_path = Path(src)
-        dst_path = Path(dst)
-        st = os.stat(src_path, follow_symlinks=False)
-        key = (st.st_dev, st.st_ino)
-        if stat.S_ISREG(st.st_mode) and key in copied:
-            os.link(copied[key], dst_path)
-            return str(dst_path)
-        result = shutil.copy2(src_path, dst_path, follow_symlinks=False)
-        if stat.S_ISREG(st.st_mode):
-            copied[key] = dst_path
-        return result
+    def copy_directory(src_fd: int, dst_dir: Path) -> None:
+        for name in os.listdir(src_fd):
+            entry_st = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
+            dst_path = dst_dir / name
+            if stat.S_ISDIR(entry_st.st_mode) and not stat.S_ISLNK(entry_st.st_mode):
+                dst_path.mkdir(exist_ok=True)
+                try:
+                    child_fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=src_fd,
+                    )
+                except OSError as exc:
+                    raise Reject("path component swap detected during staging") from exc
+                try:
+                    copy_directory(child_fd, dst_path)
+                finally:
+                    os.close(child_fd)
+                os.chown(dst_path, entry_st.st_uid, entry_st.st_gid, follow_symlinks=False)
+                os.chmod(dst_path, stat.S_IMODE(entry_st.st_mode), follow_symlinks=False)
+                os.utime(dst_path, ns=(entry_st.st_atime_ns, entry_st.st_mtime_ns), follow_symlinks=False)
+            elif stat.S_ISREG(entry_st.st_mode):
+                copy_regular_file(src_fd, name, dst_path, copied)
+            elif stat.S_ISLNK(entry_st.st_mode):
+                link_target = os.readlink(name, dir_fd=src_fd)
+                if link_target.startswith("/") or link_target.startswith("../") or "/../" in link_target:
+                    raise Reject("path component swap detected during staging")
+                dst_path.symlink_to(link_target)
+                os.lchown(dst_path, entry_st.st_uid, entry_st.st_gid)
+                os.utime(dst_path, ns=(entry_st.st_atime_ns, entry_st.st_mtime_ns), follow_symlinks=False)
+            else:
+                raise Reject("unsupported object type during staging")
 
-    shutil.copytree(source, destination, symlinks=True, copy_function=copy_file, dirs_exist_ok=True)
+    copy_directory(source_fd, destination)
 
 
 def rename_exchange(parent_fd: int, left: str, right: str) -> None:
@@ -283,7 +340,6 @@ def apply_op(root: Path, op: dict) -> None:
 
 def apply(root_name: str, bundle_name: str) -> None:
     root_name, parent_fd, root_fd, root_leaf = open_root_nofollow(root_name)
-    root = Path(root_name)
     exchanged = False
     stage: Path | None = None
     try:
@@ -292,12 +348,22 @@ def apply(root_name: str, bundle_name: str) -> None:
             doc = validate(json.load(stream))
         parent_path = f"/proc/self/fd/{parent_fd}"
         stage = Path(tempfile.mkdtemp(prefix=".rootfs-stage-", dir=parent_path))
-        copy_tree_preserving_links(root, stage)
+        for attempt in range(1024):
+            try:
+                copy_tree_preserving_links_fd(root_fd, stage)
+                break
+            except Reject as exc:
+                if "path component swap detected during staging" not in str(exc) or attempt == 1023:
+                    raise
+                shutil.rmtree(stage)
+                stage = Path(tempfile.mkdtemp(prefix=".rootfs-stage-", dir=parent_path))
+                time.sleep(0.0005)
         root_st = os.fstat(root_fd)
         os.chown(stage, root_st.st_uid, root_st.st_gid, follow_symlinks=False)
         for op in doc["operations"]:
             apply_op(stage, op)
 
+        root_st = os.fstat(root_fd)
         current = os.stat(root_leaf, dir_fd=parent_fd, follow_symlinks=False)
         if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (root_st.st_dev, root_st.st_ino):
             raise Reject("root entry changed before publication")

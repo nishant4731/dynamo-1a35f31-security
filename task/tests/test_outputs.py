@@ -878,6 +878,15 @@ def publication_crash_case(*, fallback: bool, mode: str, iteration: int) -> tupl
             exact_old = tree_matches(actual, old, bundle)
             exact_new = tree_matches(actual, new, bundle)
             outside_unchanged = outside_snapshot(canary) == outside_before
+            rejected_without_publication = returncode == 2
+            if mode == "post-rename":
+                publication_observed = returncode in {0, -signal.SIGKILL}
+            else:
+                publication_observed = (
+                    event is not None
+                    or (returncode == 0 and exact_new)
+                    or (returncode == -signal.SIGKILL and (exact_old or exact_new))
+                )
             details = {
                 "mode": mode,
                 "iteration": iteration,
@@ -886,9 +895,17 @@ def publication_crash_case(*, fallback: bool, mode: str, iteration: int) -> tupl
                 "exact_old": exact_old,
                 "exact_new": exact_new,
                 "outside_unchanged": outside_unchanged,
+                "publication_observed": publication_observed,
+                "rejected_without_publication": rejected_without_publication,
                 "actual_names": sorted(actual),
             }
-            return (exact_old or exact_new) and outside_unchanged, details
+            valid = (
+                (exact_old or exact_new)
+                and outside_unchanged
+                and publication_observed
+                and not rejected_without_publication
+            )
+            return valid, details
         finally:
             shutil.rmtree(canary, ignore_errors=True)
 
@@ -918,26 +935,53 @@ def test_path_swap_race_has_zero_canary_violations_across_64_runs():
             (root / "swap" / "inside" / "base").write_bytes(b"base")
             marker = canary / "marker"
             marker.write_bytes(f"marker-{run}".encode())
+            sync_dir = parent / f"race-sync-{run}"
+            sync_dir.mkdir()
+            candidate_go = sync_dir / "candidate_go"
+            attack_ready = sync_dir / "attack_ready"
             stop = threading.Event()
+            attack_lock = threading.Lock()
+            attack_applied = threading.Event()
 
             def mutate() -> None:
                 while not stop.is_set():
-                    moved = root / "swap" / "moved"
-                    inside = root / "swap" / "inside"
-                    try:
-                        if inside.is_dir() and not inside.is_symlink():
-                            os.rename(inside, moved)
-                            os.symlink(canary, inside)
-                            inside.unlink()
-                            os.rename(moved, inside)
-                    except (FileNotFoundError, NotADirectoryError, OSError):
-                        pass
+                    if not candidate_go.exists():
+                        continue
+                    with attack_lock:
+                        moved = root / "swap" / "moved"
+                        inside = root / "swap" / "inside"
+                        try:
+                            if inside.is_dir() and not inside.is_symlink():
+                                os.rename(inside, moved)
+                                os.symlink(canary, inside)
+                                inside.unlink()
+                                os.rename(moved, inside)
+                                attack_ready.write_text("1", encoding="ascii")
+                                attack_applied.set()
+                        except (FileNotFoundError, NotADirectoryError, OSError):
+                            pass
+                    time.sleep(0.001)
 
             thread = threading.Thread(target=mutate, daemon=True)
             thread.start()
+            candidate_go.write_text("1", encoding="ascii")
             result = run_bundle(bundle, fallback=(run % 2 == 1), root=root, timeout=8.0)
             stop.set()
             thread.join(timeout=1.0)
+            with tempfile.TemporaryDirectory(prefix="race-expected-") as expected_dir:
+                expected_root = Path(expected_dir) / "target"
+                expected_root.mkdir()
+                (expected_root / "swap" / "inside").mkdir(parents=True)
+                (expected_root / "swap" / "inside" / "base").write_bytes(b"base")
+                model_apply(expected_root, bundle["operations"])
+                expected = tree_snapshot(expected_root)
+            actual = tree_snapshot(root)
+            if not attack_applied.wait(timeout=0.5):
+                violations.append(f"run {run}: race attack was not synchronized")
+            if result.returncode != 0:
+                violations.append(f"run {run}: candidate rejected instead of confining the swap")
+            if not tree_matches(actual, expected, bundle):
+                violations.append(f"run {run}: target tree diverged from the modeled outcome")
             if marker.read_bytes() != f"marker-{run}".encode() or len(list(canary.iterdir())) != 1:
                 violations.append(f"run {run}: canary changed")
         assert not violations, "; ".join(violations)
