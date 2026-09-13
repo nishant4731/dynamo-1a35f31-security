@@ -181,7 +181,10 @@ def copy_regular_file(src_fd: int, name: str, destination: Path, copied: dict[tu
         raise Reject("path component swap detected during staging") from exc
     key = (st.st_dev, st.st_ino)
     if key in copied:
-        os.link(copied[key], destination)
+        try:
+            os.link(copied[key], destination)
+        except OSError as exc:
+            raise Reject("path component swap detected during staging") from exc
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -303,7 +306,11 @@ def copy_tree_preserving_links_fd(
     os.utime(destination, ns=(root_st.st_atime_ns, root_st.st_mtime_ns), follow_symlinks=False)
 
     def copy_directory(src_fd: int, dst_dir: Path, rel: str) -> None:
-        for name in os.listdir(src_fd):
+        try:
+            names = os.listdir(src_fd)
+        except OSError as exc:
+            raise Reject("path component swap detected during staging") from exc
+        for name in names:
             child_rel = f"{rel}/{name}" if rel else name
             try:
                 entry_st = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
@@ -438,7 +445,6 @@ def apply(root_name: str, bundle_name: str) -> None:
     exchanged = False
     stage: Path | None = None
     try:
-        audit_initial_tree(root_fd)
         with open(bundle_name, "r", encoding="utf-8") as stream:
             doc = validate(json.load(stream))
         required_dirs = required_directory_prefixes(doc)
@@ -454,6 +460,7 @@ def apply(root_name: str, bundle_name: str) -> None:
                         break
                     time.sleep(0.00005)
             try:
+                audit_initial_tree(root_fd)
                 copy_tree_preserving_links_fd(root_fd, stage, required_dirs)
                 if stage_lost_required_directory(stage, root_fd, required_dirs):
                     raise Reject("path component swap detected during staging")
@@ -482,7 +489,7 @@ def apply(root_name: str, bundle_name: str) -> None:
                 swap = Reject("path component swap detected during staging")
                 if not staging_should_retry(swap, stage, root_fd, required_dirs):
                     raise swap from exc
-            shutil.rmtree(stage)
+            shutil.rmtree(stage, ignore_errors=True)
             stage = Path(tempfile.mkdtemp(prefix=".rootfs-stage-", dir=parent_path))
     finally:
         if not exchanged and stage is not None and os.path.lexists(stage):
