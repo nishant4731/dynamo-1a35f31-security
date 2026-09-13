@@ -376,7 +376,7 @@ def apply(root_name: str, bundle_name: str) -> None:
         required_dirs = required_directory_prefixes(doc)
         parent_path = f"/proc/self/fd/{parent_fd}"
         stage = Path(tempfile.mkdtemp(prefix=".rootfs-stage-", dir=parent_path))
-        staging_attempts = 1024
+        staging_attempts = 4096
         for attempt in range(staging_attempts):
             try:
                 copy_tree_preserving_links_fd(root_fd, stage, required_dirs)
@@ -386,7 +386,7 @@ def apply(root_name: str, bundle_name: str) -> None:
                     raise
                 shutil.rmtree(stage)
                 stage = Path(tempfile.mkdtemp(prefix=".rootfs-stage-", dir=parent_path))
-                time.sleep(0.0005)
+                time.sleep(0.0001)
         root_st = os.fstat(root_fd)
         os.chown(stage, root_st.st_uid, root_st.st_gid, follow_symlinks=False)
         for op in doc["operations"]:
