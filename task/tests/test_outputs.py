@@ -939,7 +939,7 @@ def test_publication_crash_cuts_are_always_exact_old_or_new(fallback: bool):
 
 
 def test_path_swap_race_has_zero_canary_violations_across_64_runs():
-    """A deterministic 64-run path-component swap race must never write the outside canary."""
+    """Every synchronized swap attack must confine writes, exit zero, and match the modeled tree."""
     parent = Path(tempfile.mkdtemp(prefix="race-parent-"))
     canary = Path(tempfile.mkdtemp(prefix="race-canary-"))
     bundle = {"format": 1, "operations": [{"op": "write", "path": "swap/inside/payload", "data_b64": enc(b"must-stay-inside")}]}
